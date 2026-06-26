@@ -108,6 +108,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     max_reset_zeros_freq = 8
     max_rot = 4.0
     max_offset = 0.05
+    
+    desired_base_height = 0.28
 
     planner_history_len = 100
     lidar_num_cells = int((lidar_x_range[1] - lidar_x_range[0]) / lidar_cell_size) * int(
@@ -161,6 +163,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             maze_width_scale=16.0,
             terrain_num_rows=NUM_ROWS,
             terrain_num_cols=NUM_COLS,
+            p_wall_dest=1.0,
             curriculum=True,
             difficulty_range=(0.0, 1.0),
             wall_height_range=(0.75, 2.0),
@@ -201,29 +204,26 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     lidar_offset = (0.28945, 0.0, -0.04682)
     lidar_rotation = (0.13131596830945724, 0.0, 0.9913405653290647, 0.0)
     height_scanner = RayCasterCfg(
-        prim_path="/World/envs/env_.*/Robot/base",
+        prim_path="/World/envs/env_.*/Robot/base/radar",
         update_period=1 / 60,
         offset=RayCasterCfg.OffsetCfg(
-            pos=lidar_offset,
-            rot=lidar_rotation,
+            # pos=lidar_offset,
+            # rot=lidar_rotation,
         ),
         mesh_prim_paths=["/World"],
         ray_alignment="base",
         pattern_cfg=patterns.LidarPatternCfg(
-            channels=64,
-            vertical_fov_range=[0.0, 90.0],
-            horizontal_fov_range=[-180, 180],
-            horizontal_res=2.0,
+            channels=64, vertical_fov_range=[0.0, 90.0], horizontal_fov_range=[-180, 180], horizontal_res=2.0
         ),
-        max_distance=20.0,
-        debug_vis=False,
+        max_distance=2.0,
+        debug_vis=True,
     )
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
 
     # planner -> locomotion policy interface
-    locomotion_policy_path = "policies/policy_cnn_rnn_seq2.pt"
+    locomotion_policy_path = "policies/policy_cnn_rnn_seq3.pt"
     require_locomotion_policy = True
     locomotion_observation_dim = 195
     locomotion_action_scale = 0.25

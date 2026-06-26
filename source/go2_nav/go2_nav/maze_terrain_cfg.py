@@ -330,7 +330,7 @@ def maze_terrain(
 
 
     # Sample wall destroy
-    p_wall_dest = 0.3
+    p_wall_dest = cfg.p_wall_dest
     
     # Sample maze height and derive maze width from curriculum difficulty.
     min_rows = max(2, min(int(cfg.maze_height_range[0]), int(cfg.maze_height_range[1])))
@@ -597,6 +597,7 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
     wall_thickness: float = 0.05
     wall_thickness_range: tuple[float, float] | None = None
     floor_thickness: float = 0.08
+    p_wall_dest: float = 0.3
 
     # Stairs parameters.
     stairs_prob_per_m2: float = 0.15
@@ -667,6 +668,7 @@ def make_maze_terrain_cfg(
     wall_height_range: tuple[float, float] = (0.5, 0.5),
     wall_thickness_range: tuple[float, float] = (0.05, 0.05),
     floor_thickness: float = 0.08,
+    p_wall_dest: float = 0.3,
     algorithm: Literal["dfs", "kruskal", "prims", "wilson"] = "dfs",
     seed: int | None = 0,
     stairs_prob_per_m2_range: tuple[float, float] = (0.15, 0.15),
@@ -713,6 +715,8 @@ def make_maze_terrain_cfg(
         wall_thickness_low, max(float(wall_thickness_range[0]), float(wall_thickness_range[1]))
     )
 
+    p_wall_dest = min(1.0, max(0.0, p_wall_dest))
+    
     stairs_prob_low = max(0.0, min(float(stairs_prob_per_m2_range[0]), float(stairs_prob_per_m2_range[1])))
     stairs_prob_high = max(stairs_prob_low, max(float(stairs_prob_per_m2_range[0]), float(stairs_prob_per_m2_range[1])))
     boxes_prob_low = max(0.0, min(float(boxes_prob_per_m2_range[0]), float(boxes_prob_per_m2_range[1])))
