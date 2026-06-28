@@ -249,6 +249,18 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             ),
         },
     )
+    
+    start_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/startMarkers",
+        markers={
+            "start": sim_utils.UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                scale=(0.5, 0.5, 0.5),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+            ),
+        },
+    )
+    
     # planner -> locomotion policy interface
     locomotion_policy_path = "policies/policy_cnn_rnn_seq3.pt"
     require_locomotion_policy = True
