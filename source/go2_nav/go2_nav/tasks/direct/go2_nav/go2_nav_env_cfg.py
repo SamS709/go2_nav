@@ -6,7 +6,7 @@ import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -16,6 +16,8 @@ from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCfg, RayCasterCfg, patterns
+from isaaclab.markers import VisualizationMarkersCfg
 
 from go2_nav.maze_terrain_cfg import make_maze_terrain_cfg  # isort: skip
 
@@ -121,7 +123,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Expose critic state-space as privileged teacher observations for asymmetric PPO.
     state_space = teacher_observation_space
 
-    randomize = True
+    randomize = False
     # events: EventCfg = EventCfg()
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -137,8 +139,15 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     )
 
     # terrain
-    NUM_ROWS = 1
-    NUM_COLS = 1
+    # terrain configuration to match the goal generator:
+    # Ensure that NUM_ROWS == maze_max_rows. This implies at row 1 & 2 the mazes have 1 row, and after it is increasing by 1 each row.
+    # For example, if NUM_ROWS == MAZE_WIDTH_SIZE == 10, at row 1 & 2, mazes will have 1 raw, at raw 3, 2 raws, ..., at row 10, 9 rows, thanks to difficulty (keep its range == [0,1])
+    # Same for NUM_COLS == maze_max_cols
+    
+    # n_cols for the maze is constant fixed to maze_height
+    NUM_ROWS = 10
+    NUM_COLS = 5
+    # y <=> cols & x <=> rows
     # debug: flat ground plane terrain
     # terrain = TerrainImporterCfg(
     #     prim_path="/World/ground_plane",
@@ -159,11 +168,11 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         max_init_terrain_level=1,
         terrain_generator=make_maze_terrain_cfg(
             cell_size=2.0,
-            maze_height_range=(8, 16),
-            maze_width_scale=16.0,
+            maze_max_cols=5.0,
+            maze_max_rows=10.0,
             terrain_num_rows=NUM_ROWS,
             terrain_num_cols=NUM_COLS,
-            p_wall_dest=1.0,
+            p_wall_dest=0.3,
             curriculum=True,
             difficulty_range=(0.0, 1.0),
             wall_height_range=(0.75, 2.0),
@@ -171,6 +180,9 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             floor_thickness=0.06,
             algorithm="dfs",
             seed=42,
+            # stairs_prob_per_m2_range=(1.0, 1.0),
+            # boxes_prob_per_m2_range=(0.0, 0.0),
+            # rough_prob_per_m2_range=(0.0, 0.0),
             stairs_prob_per_m2_range=(0.02, 0.08),
             boxes_prob_per_m2_range=(0.04, 0.12),
             rough_prob_per_m2_range=(0.10, 0.24),
@@ -199,10 +211,12 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
 
     # robot(s)
     robot_cfg: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-
+    contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/.*", history_length=3, update_period=0.005, track_air_time=True
+    )
     # lidar (same mounting used in go2_lidar task)
-    lidar_offset = (0.28945, 0.0, -0.04682)
-    lidar_rotation = (0.13131596830945724, 0.0, 0.9913405653290647, 0.0)
+    # lidar_offset = (0.28945, 0.0, -0.04682)
+    # lidar_rotation = (0.13131596830945724, 0.0, 0.9913405653290647, 0.0)
     height_scanner = RayCasterCfg(
         prim_path="/World/envs/env_.*/Robot/base/radar",
         update_period=1 / 60,
@@ -216,12 +230,23 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             channels=64, vertical_fov_range=[0.0, 90.0], horizontal_fov_range=[-180, 180], horizontal_res=2.0
         ),
         max_distance=2.0,
-        debug_vis=True,
+        debug_vis=False,
     )
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
 
+    # markers
+    
+    goal_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/GoalMarkers",
+        markers={
+            "goal": sim_utils.SphereCfg(
+                radius=1.0,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+            ),
+        },
+    )
     # planner -> locomotion policy interface
     locomotion_policy_path = "policies/policy_cnn_rnn_seq3.pt"
     require_locomotion_policy = True
@@ -254,5 +279,3 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     reset_joint_pos_noise = 0.05
     reset_joint_vel_noise = 0.10
     
-    sigma = 4.00
-    n_zeros = 30

@@ -14,7 +14,7 @@ from typing import Literal
 import numpy as np
 import trimesh
 
-from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
+from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg, FlatPatchSamplingCfg
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from labyrinth.generate import DepthFirstSearchGenerator, KruskalsGenerator, PrimsGenerator, WilsonsGenerator
@@ -112,7 +112,7 @@ def _append_stairs_meshes(
     landing_depth: float | None,
     start_down: bool,
     max_length: float | None,
-    max_width: float | None,
+    max_rows: float | None,
 ) -> tuple[float, float]:
     """Append a double-flight stair mesh sequence and return (length, width) footprint."""
     if num_steps < 1:
@@ -121,9 +121,9 @@ def _append_stairs_meshes(
     step_height = max(1e-4, step_height)
     step_depth = max(1e-4, step_depth)
 
-    # Stair footprint is fixed by the cell dimensions when max_length/max_width are provided.
-    if max_width is not None:
-        step_width = max(1e-4, max_width)
+    # Stair footprint is fixed by the cell dimensions when max_length/max_rows are provided.
+    if max_rows is not None:
+        step_width = max(1e-4, max_rows)
     else:
         step_width = max(1e-4, step_width)
 
@@ -331,43 +331,27 @@ def maze_terrain(
 
     # Sample wall destroy
     p_wall_dest = cfg.p_wall_dest
+     
+
+    max_rows = max(1, int(round(cfg.maze_max_rows)))
+    maze_rows = int(difficulty * cfg.maze_max_rows)
+    maze_rows = max(1, min(max_rows, maze_rows))
     
-    # Sample maze height and derive maze width from curriculum difficulty.
-    min_rows = max(2, min(int(cfg.maze_height_range[0]), int(cfg.maze_height_range[1])))
-    max_rows = max(min_rows, max(int(cfg.maze_height_range[0]), int(cfg.maze_height_range[1])))
-
-    max_cols = max(1, int(round(cfg.maze_width_scale)))
-    maze_cols = int(difficulty * cfg.maze_width_scale)
-    maze_cols = max(1, min(max_cols, maze_cols))
-
-    if cfg.seed is None:
-        maze_rows = random.randint(min_rows, max_rows)
-        call_seed = None
-    else:
-        call_seed = int(cfg.seed) + int(round(difficulty * 1_000_000))
-        maze_rows = random.Random(call_seed).randint(min_rows, max_rows)
-
+    maze_cols = max(1, int(round(cfg.maze_max_cols)))
+    
     # Keep maze cell size fixed; difficulty changes cell count, not physical cell dimensions.
     cell_w = cfg.cell_size
     cell_h = cfg.cell_size
 
-    maze_size_x = maze_cols * cell_w
-    maze_size_y = maze_rows * cell_h
+    maze_size_x = maze_rows * cell_w
+    maze_size_y = maze_cols * cell_h
     offset_x = 0.5 * (cfg.size[0] - maze_size_x)
     offset_y = 0.5 * (cfg.size[1] - maze_size_y)
 
-    # Labyrinth generators use Python's global random module.
-    random_state = random.getstate()
-    if call_seed is not None:
-        random.seed(call_seed)
-    try:
-        maze = Maze(width=maze_cols, height=maze_rows, generator=_make_generator(cfg.algorithm))
-    finally:
-        if call_seed is not None:
-            random.setstate(random_state)
+    maze = Maze(width=maze_cols, height=maze_rows, generator=_make_generator(cfg.algorithm))
 
     # Dedicated RNG for feature placement.
-    rng = random.Random(call_seed) if call_seed is not None else random.Random()
+    rng = random.Random(cfg.seed)
 
     # Sample tile-level parameters from configured ranges.
     wall_height = _sample_float(rng, cfg.wall_height, cfg.wall_height_range)
@@ -417,45 +401,45 @@ def maze_terrain(
     for row in range(maze_rows):
         for col in range(maze_cols):
             cell = maze.get_cell(row, col)
-            cx = offset_x + (col + 0.5) * cell_w
-            cy = offset_y + (row + 0.5) * cell_h
+            cx = offset_x + (row + 0.5) * cell_w
+            cy = offset_y + (col + 0.5) * cell_h
             # North wall
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) <= p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
             if Direction.N not in cell.open_walls and not dest_wall_cond:
                 meshes.append(
                     _box_mesh(
                         (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + row * cell_h, 0.5 * wall_height),
+                        (cx, offset_y + col * cell_h, 0.5 * wall_height),
                     )
                 )
 
             # West wall
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) <= p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
             if Direction.W not in cell.open_walls and not dest_wall_cond:
                 meshes.append(
                     _box_mesh(
                         (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + col * cell_w, cy, 0.5 * wall_height),
+                        (offset_x + row * cell_w, cy, 0.5 * wall_height),
                     )
                 )
 
             # South boundary
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) <= p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
             if row == maze_rows - 1 and Direction.S not in cell.open_walls and not dest_wall_cond:
                 meshes.append(
                     _box_mesh(
                         (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
+                        (cx, offset_y + (col + 1) * cell_h, 0.5 * wall_height),
                     )
                 )
 
             # East boundary
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) <= p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
             if col == maze_cols - 1 and Direction.E not in cell.open_walls and not dest_wall_cond:
                 meshes.append(
                     _box_mesh(
                         (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
+                        (offset_x + (row + 1) * cell_w, cy, 0.5 * wall_height),
                     )
                 )
 
@@ -493,7 +477,7 @@ def maze_terrain(
                     landing_depth=cfg.stairs_landing_depth,
                     start_down=start_down,
                     max_length=stair_total_length,
-                    max_width=stair_total_width,
+                    max_rows=stair_total_width,
                 )
                 stairs_cells.add((row, col))
                 hole_margin = max(0.0, cfg.stairs_hole_margin)
@@ -538,10 +522,10 @@ def maze_terrain(
     if cfg.floor_thickness > 0.0:
         for row in range(maze_rows):
             for col in range(maze_cols):
-                cx = (col + 0.5) * cell_w
-                cy = (row + 0.5) * cell_h
-                cx = offset_x + (col + 0.5) * cell_w
-                cy = offset_y + (row + 0.5) * cell_h
+                cx = (row) * cell_w
+                cy = (col + 0.5) * cell_h
+                cx = offset_x + (row + 0.5) * cell_w
+                cy = offset_y + (col + 0.5) * cell_h
                 if (row, col) in stairs_footprints:
                     stairs_dir, hole_length, hole_width = stairs_footprints[(row, col)]
                     _append_floor_ring_with_hole(
@@ -558,10 +542,10 @@ def maze_terrain(
                 else:
                     _append_floor_rect(
                         meshes,
-                        x0=offset_x + col * cell_w,
-                        x1=offset_x + (col + 1) * cell_w,
-                        y0=offset_y + row * cell_h,
-                        y1=offset_y + (row + 1) * cell_h,
+                        x0=offset_x + row * cell_w,
+                        x1=offset_x + (row + 1) * cell_w,
+                        y0=offset_y + col * cell_h,
+                        y1=offset_y + (col + 1) * cell_h,
                         floor_thickness=cfg.floor_thickness,
                     )
 
@@ -578,7 +562,7 @@ def maze_terrain(
 
     # Robot spawn origin is the center of a reserved maze cell.
     spawn_row, spawn_col = spawn_cell
-    origin = np.array([offset_x + (spawn_col + 0.5) * cell_w, offset_y + (spawn_row + 0.5) * cell_h, 0.0])
+    origin = np.array([offset_x + (spawn_row + 0.5) * cell_w, offset_y + (spawn_col + 0.5) * cell_h, 0.0])
     return meshes, origin
 
 
@@ -589,8 +573,10 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
     function = maze_terrain
 
     cell_size: float = 0.6
-    maze_height_range: tuple[int, int] = (8, 16)
-    maze_width_scale: float = 16.0
+    maze_max_cols: float = 10.0
+    maze_max_rows: float = 10.0
+    maze_cols: float | None = None # shouldn't be specified: useful to retrieve information during training
+    maze_rows: float | None = None # shouldn't be specified: useful to retrieve information during training
 
     wall_height: float = 0.5
     wall_height_range: tuple[float, float] | None = None
@@ -657,7 +643,15 @@ MAZE_TERRAIN_CFG = TerrainGeneratorCfg(
             floor_thickness=0.08,
             algorithm="dfs",
             seed=0,
+            flat_patch_sampling={
+                "goal_spawn": FlatPatchSamplingCfg(
+                    num_patches=10,
+                    patch_radius=0.3,
+                    max_height_diff=0.1,
+                )
+            },
         )
+        
     },
 )
 """Base maze terrain configuration (same usage pattern as ROUGH_TERRAINS_CFG)."""
@@ -692,21 +686,17 @@ def make_maze_terrain_cfg(
     terrain_num_cols: int = 1,
     curriculum: bool = False,
     difficulty_range: tuple[float, float] = (0.0, 1.0),
-    maze_height_range: tuple[int, int] = (8, 16),
-    maze_width_scale: float = 16.0,
+    maze_max_cols: float = 10.0,
+    maze_max_rows: float = 10.0,
 ) -> TerrainGeneratorCfg:
     """Create a MAZE_TERRAIN_CFG instance for runtime values.
 
     Returns:
         TerrainGeneratorCfg: Can be passed directly to TerrainImporterCfg(terrain_type="generator").
     """
-    cell_size = max(1e-4, cell_size)
-    terrain_num_rows = max(1, int(terrain_num_rows))
-    terrain_num_cols = max(1, int(terrain_num_cols))
 
-    min_rows = max(2, min(int(maze_height_range[0]), int(maze_height_range[1])))
-    max_rows = max(min_rows, max(int(maze_height_range[0]), int(maze_height_range[1])))
-    width_scale = max(1.0, float(maze_width_scale))
+    max_cols = max(1.0, float(maze_max_cols))
+    max_rows = max(1.0, float(maze_max_rows))
 
     wall_height_low = max(1e-4, min(float(wall_height_range[0]), float(wall_height_range[1])))
     wall_height_high = max(wall_height_low, max(float(wall_height_range[0]), float(wall_height_range[1])))
@@ -756,20 +746,22 @@ def make_maze_terrain_cfg(
     )
 
     # The sub-terrain tile is sized to the maximum maze extent.
-    terrain_size_x = width_scale * cell_size
-    terrain_size_y = max_rows * cell_size
+    terrain_size = max(max_rows * cell_size, max_cols * cell_size)
+    terrain_size_x = terrain_size
+    terrain_size_y = terrain_size
     diff_low = min(float(difficulty_range[0]), float(difficulty_range[1]))
     diff_high = max(float(difficulty_range[0]), float(difficulty_range[1]))
 
     sub_cfg = MAZE_TERRAIN_CFG.sub_terrains["maze"].replace(
         cell_size=cell_size,
-        maze_height_range=(min_rows, max_rows),
-        maze_width_scale=width_scale,
+        maze_max_cols=max_cols,
+        maze_max_rows=max_rows,
         wall_height=wall_height_low,
         wall_height_range=(wall_height_low, wall_height_high),
         wall_thickness=wall_thickness_low,
         wall_thickness_range=(wall_thickness_low, wall_thickness_high),
         floor_thickness=floor_thickness,
+        p_wall_dest=p_wall_dest,
         algorithm=algorithm,
         seed=seed,
         stairs_prob_per_m2=stairs_prob_low,
