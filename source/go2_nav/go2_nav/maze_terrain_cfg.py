@@ -343,8 +343,8 @@ def maze_terrain(
     cell_w = cfg.cell_size
     cell_h = cfg.cell_size
 
-    maze_size_x = maze_rows * cell_w
-    maze_size_y = maze_cols * cell_h
+    maze_size_x = maze_cols * cell_w
+    maze_size_y = maze_rows * cell_h
     offset_x = 0.5 * (cfg.size[0] - maze_size_x)
     offset_y = 0.5 * (cfg.size[1] - maze_size_y)
 
@@ -401,15 +401,15 @@ def maze_terrain(
     for row in range(maze_rows):
         for col in range(maze_cols):
             cell = maze.get_cell(row, col)
-            cx = offset_x + (row + 0.5) * cell_w
-            cy = offset_y + (col + 0.5) * cell_h
+            cx = offset_x + (col + 0.5) * cell_w
+            cy = offset_y + (row + 0.5) * cell_h
             # North wall
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
             if Direction.N not in cell.open_walls and not dest_wall_cond:
                 meshes.append(
                     _box_mesh(
                         (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + col * cell_h, 0.5 * wall_height),
+                        (cx, offset_y + row * cell_h, 0.5 * wall_height),
                     )
                 )
 
@@ -419,7 +419,7 @@ def maze_terrain(
                 meshes.append(
                     _box_mesh(
                         (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + row * cell_w, cy, 0.5 * wall_height),
+                        (offset_x + col * cell_w, cy, 0.5 * wall_height),
                     )
                 )
 
@@ -429,7 +429,7 @@ def maze_terrain(
                 meshes.append(
                     _box_mesh(
                         (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + (col + 1) * cell_h, 0.5 * wall_height),
+                        (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
                     )
                 )
 
@@ -439,7 +439,7 @@ def maze_terrain(
                 meshes.append(
                     _box_mesh(
                         (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + (row + 1) * cell_w, cy, 0.5 * wall_height),
+                        (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
                     )
                 )
 
@@ -522,10 +522,10 @@ def maze_terrain(
     if cfg.floor_thickness > 0.0:
         for row in range(maze_rows):
             for col in range(maze_cols):
-                cx = (row) * cell_w
-                cy = (col + 0.5) * cell_h
-                cx = offset_x + (row + 0.5) * cell_w
-                cy = offset_y + (col + 0.5) * cell_h
+                cx = (col + 0.5) * cell_w
+                cy = (row + 0.5) * cell_h
+                cx = offset_x + (col + 0.5) * cell_w
+                cy = offset_y + (row + 0.5) * cell_h
                 if (row, col) in stairs_footprints:
                     stairs_dir, hole_length, hole_width = stairs_footprints[(row, col)]
                     _append_floor_ring_with_hole(
@@ -542,10 +542,10 @@ def maze_terrain(
                 else:
                     _append_floor_rect(
                         meshes,
-                        x0=offset_x + row * cell_w,
-                        x1=offset_x + (row + 1) * cell_w,
-                        y0=offset_y + col * cell_h,
-                        y1=offset_y + (col + 1) * cell_h,
+                        x0=offset_x + col * cell_w,
+                        x1=offset_x + (col + 1) * cell_w,
+                        y0=offset_y + row * cell_h,
+                        y1=offset_y + (row + 1) * cell_h,
                         floor_thickness=cfg.floor_thickness,
                     )
 
@@ -562,7 +562,7 @@ def maze_terrain(
 
     # Robot spawn origin is the center of a reserved maze cell.
     spawn_row, spawn_col = spawn_cell
-    origin = np.array([offset_x + (spawn_row + 0.5) * cell_w, offset_y + (spawn_col + 0.5) * cell_h, 0.0])
+    origin = np.array([offset_x + (spawn_col + 0.5) * cell_w, offset_y + (spawn_row + 0.5) * cell_h, 0.0])
     return meshes, origin
 
 
