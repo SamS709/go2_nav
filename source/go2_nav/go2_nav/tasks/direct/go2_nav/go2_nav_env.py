@@ -63,10 +63,7 @@ class Go2NavEnv(DirectRLEnv):
         self.prev_low_level_actions = torch.zeros_like(self.low_level_actions)
         self.low_level_joint_targets = self.robot.data.default_joint_pos.clone()
 
-        self.goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self.goal_yaw_w = torch.zeros(self.num_envs, device=self.device)
-        self.prev_goal_distance = torch.zeros(self.num_envs, device=self.device)
-        self.goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._init_goals()
 
         self._lidar_x_cells = max(
             1, int((float(self.cfg.lidar_x_range[1]) - float(self.cfg.lidar_x_range[0])) / float(self.cfg.lidar_cell_size))
@@ -95,6 +92,14 @@ class Go2NavEnv(DirectRLEnv):
 
         self._finite_warn_counter = 0
         self.locomotion_policy = self._load_locomotion_policy(self.cfg.locomotion_policy_path)
+        
+    def _init_goals(self):
+        self.goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self.goal_yaw_w = torch.zeros(self.num_envs, device=self.device)
+        self.prev_goal_distance = torch.zeros(self.num_envs, device=self.device)
+        self.goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self._update_goals(all_env_ids, center=True)
         
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -215,6 +220,9 @@ class Go2NavEnv(DirectRLEnv):
             "teacher_proprio": teacher_proprio,
             "teacher_height_scan": teacher_height_scan,
         }
+        
+    def log_infos(self):
+        pass
 
     def _get_rewards(self) -> torch.Tensor:
         terrain_cfg = self.cfg.terrain.terrain_generator
@@ -225,6 +233,8 @@ class Go2NavEnv(DirectRLEnv):
         goal_delta_xy = self.goal_pos_w[:, :2] - root_pos_w[:, :2]
         goal_distance = torch.linalg.norm(goal_delta_xy, dim=-1)
         goal_progress = self.prev_goal_distance - goal_distance
+        self.log_infos()
+        
 
         yaw_error = self._wrap_to_pi(self.goal_yaw_w - self._quat_to_yaw(self.robot.data.root_quat_w))
 
@@ -325,7 +335,7 @@ class Go2NavEnv(DirectRLEnv):
         self.prev_low_level_actions[env_ids_tensor] = 0.0
         self.goal_reached[env_ids_tensor] = False
 
-        self._update_goals(env_ids_tensor)
+        self._update_goals(env_ids_tensor, False)
         self.prev_goal_distance[env_ids_tensor] = torch.linalg.norm(
             self.goal_pos_w[env_ids_tensor, :2] - default_root_state[:, :2], dim=-1
         )
@@ -573,86 +583,76 @@ class Go2NavEnv(DirectRLEnv):
         )
 
 
-    def _update_goals(self, env_ids: torch.Tensor) -> None:
-        all_patches = self._terrain.flat_patches["goal_spawn"]  # (num_rows, num_cols, num_patches, 3)
+    def _update_goals(self, env_ids: torch.Tensor, center: bool = False) -> None:
+        """Update goal positions for the given envs.
 
-        row = self._terrain.terrain_levels[env_ids]  # (len(env_ids),)
-        col = self._terrain.terrain_types[env_ids]   # (len(env_ids),)
+        If ``center`` is True, the goal is placed at the center of each env's
+        maze. Otherwise, the goal is sampled uniformly at random over the actual
+        n-bounds extent of that env's maze.
 
-        candidates = all_patches[row, col]  # (len(env_ids), num_patches, 3)
+        Per-env maze row count follows the curriculum: terrain levels 0 and 1 both
+        produce a 1-row maze, and level k (k >= 2) produces a k-row maze, clamped to
+        `maze_max_rows`. Column count is always the fixed `maze_max_cols`.
+        """
+        terrain_generator = self.cfg.terrain.terrain_generator
+        maze_cfg = terrain_generator.sub_terrains["maze"]
+        cell_size = float(maze_cfg.cell_size)
 
-        idx = torch.randint(0, candidates.shape[1], (len(env_ids),), device=self.device)
-        goal_pos_w = candidates[torch.arange(len(env_ids), device=self.device), idx]  # (len(env_ids), 3)
+        max_rows = max(1, int(round(maze_cfg.maze_max_rows)))
+        max_cols = max(1, int(round(maze_cfg.maze_max_cols)))
 
-        self.goal_pos_w[env_ids] = goal_pos_w  # store it — you read self.goal_pos_w below but never wrote to it!
+        # Per-env curriculum level (0-indexed). Levels 0 & 1 -> 1 row; level k (k>=2) -> k rows.
+        levels = self._terrain.terrain_levels[env_ids].to(dtype=torch.long)
+        maze_rows = torch.clamp(levels, min=1, max=max_rows)
+        maze_cols = torch.full_like(maze_rows, max_cols)
 
-        goal_quat_w = torch.zeros(len(env_ids), 4, device=self.device)
-        goal_quat_w[:, 0] = 1.0
+        maze_rows_f = maze_rows.to(dtype=torch.float32)
+        maze_cols_f = maze_cols.to(dtype=torch.float32)
 
-        self.goal_markers.visualize(
-            translations=self.goal_pos_w[env_ids],
-            orientations=goal_quat_w,
-        )
-
-    def _update_goals2(self, env_ids: torch.Tensor) -> None:
-        # terrain_generator = self.cfg.terrain.terrain_generator
-        # maze_cfg = terrain_generator.sub_terrains["maze"]
-
-        # cell_size = maze_cfg.cell_size
-        # terrain = self.cfg.terrain
-        # row = terrain.terrain_levels[env_ids]
-        # col = terrain.terrain_types[env_ids]
-        candidates = self._terrain.flat_patches["goal_spawn"][0,0]  # (len(env_ids), num_patches, 3)
-        idx = torch.randint(0, candidates.shape[1], (len(env_ids),), device=self.device)
-        goal_pos_w = candidates[torch.arange(len(env_ids)), idx]
-        # width_scale = max(1.0, float(maze_cfg.maze_max_width))
-        # max_cols = max(1, int(round(width_scale)))
-        # max_rows = max(2, int(max(maze_cfg.maze_height_range[0], maze_cfg.maze_height_range[1])))
-
-        # diff_low = float(terrain_generator.difficulty_range[0])
-        # diff_high = float(terrain_generator.difficulty_range[1])
-        # num_terrain_rows = max(1, int(terrain_generator.num_rows))
-
-        # if hasattr(self._terrain, "terrain_levels"):
-        #     levels = self._terrain.terrain_levels[env_ids].to(dtype=torch.float32)
-        # else:
-        #     levels = torch.zeros(len(env_ids), device=self.device, dtype=torch.float32)
-
-        # if num_terrain_rows > 1:
-        #     level_frac = levels / float(num_terrain_rows - 1)
-        # else:
-        #     level_frac = torch.zeros_like(levels)
-        # level_frac = torch.clamp(level_frac, 0.0, 1.0)
-
-        # difficulty = diff_low + level_frac * (diff_high - diff_low)
-        # maze_cols = torch.clamp((difficulty * width_scale).to(torch.long), min=1, max=max_cols)
-
-        # terrain_size_x = float(terrain_generator.size[0])
-        # terrain_size_y = float(terrain_generator.size[1])
-
-        # maze_cols_f = maze_cols.to(dtype=torch.float32)
-        # maze_rows_f = torch.full_like(maze_cols_f, float(max_rows))
-
-        # offset_x = 0.5 * (terrain_size_x - maze_cols_f * cell_size)
-        # offset_y = 0.5 * (terrain_size_y - maze_rows_f * cell_size)
-
-        # goal_local_x = offset_x + (maze_cols_f - 0.5) * cell_size
-        # goal_local_y = offset_y + (maze_rows_f - 0.5) * cell_size
-
-        # self.goal_pos_w[env_ids, 0] = self._terrain.env_origins[env_ids, 0] + goal_local_x
-        # self.goal_pos_w[env_ids, 1] = self._terrain.env_origins[env_ids, 1] + goal_local_y
-        # self.goal_pos_w[env_ids, 2] = self._terrain.env_origins[env_ids, 2]
-        # self.goal_yaw_w[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
+        # Per-env maze extent (rows -> world x, cols -> world y), centered on the tile.
+        x_extent = maze_rows_f * cell_size
+        y_extent = maze_cols_f * cell_size
         
-        goal_quat_w = torch.zeros(len(env_ids), 4, device=self.device)
-        goal_quat_w[:, 0] = 1.0
-        print(goal_pos_w)
-        goal_pos_w_markers = self.goal_pos_w[env_ids].clone()
-        goal_pos_w_markers[:,2] += 1.0
+        if center:
+            # Maze is always centered on its tile, regardless of row/col count, so the
+            # goal is simply the tile center -- no sampling needed.
+            goal_local_x = torch.zeros_like(x_extent)
+            goal_local_y = torch.zeros_like(y_extent)
+        else:
+            # Sample a uniformly random in-bounds point within the maze's footprint.
+            # Bounds are [tile_center - extent/2, tile_center + extent/2] per axis.
+            x_min = - 0.5 * x_extent
+            x_max = + 0.5 * x_extent
+            y_min = - 0.5 * y_extent
+            y_max = + 0.5 * y_extent
+
+            u_x = torch.rand(len(env_ids), device=self.device)
+            u_y = torch.rand(len(env_ids), device=self.device)
+            goal_local_x = x_min + u_x * (x_max - x_min)
+            goal_local_y = y_min + u_y * (y_max - y_min)
+            goal_local_x = torch.where(goal_local_x >= 0.0, (goal_local_x // cell_size) * cell_size, (goal_local_x // cell_size + 1) * cell_size)
+            goal_local_y = torch.where(goal_local_y >= 0.0, (goal_local_y // cell_size) * cell_size, (goal_local_y // cell_size + 1) * cell_size)
+            
+
+        env_origins = self._terrain.env_origins[env_ids]
+        
+        self.goal_pos_w[env_ids, 0] = env_origins[:, 0] + goal_local_x
+        self.goal_pos_w[env_ids, 1] = env_origins[:, 1] + goal_local_y
+        self.goal_pos_w[env_ids, 2] = env_origins[:, 2]
+
+        self.goal_yaw_w[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
+        goal_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
+        goal_quat_w[:, 0] = torch.cos(self.goal_yaw_w / 2)  # w
+        goal_quat_w[:, 1] = 0.0                             # x
+        goal_quat_w[:, 2] = 0.0                             # y
+        goal_quat_w[:, 3] = torch.sin(self.goal_yaw_w / 2)  # z
+
         self.goal_markers.visualize(
-            translations=self.goal_pos_w[env_ids],
+            translations=self.goal_pos_w,
             orientations=goal_quat_w,
         )
+        
+    
         
     @staticmethod
     def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:

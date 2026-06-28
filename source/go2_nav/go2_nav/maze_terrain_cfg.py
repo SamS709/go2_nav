@@ -680,13 +680,6 @@ MAZE_TERRAIN_CFG = TerrainGeneratorCfg(
             floor_thickness=0.08,
             algorithm="dfs",
             seed=0,
-            flat_patch_sampling={
-                "goal_spawn": FlatPatchSamplingCfg(
-                    num_patches=10,
-                    patch_radius=0.3,
-                    max_height_diff=0.1,
-                )
-            },
         )
         
     },

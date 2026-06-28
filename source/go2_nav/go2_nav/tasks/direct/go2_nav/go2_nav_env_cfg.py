@@ -7,6 +7,7 @@ import isaaclab.sim as sim_utils
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -145,7 +146,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Same for NUM_COLS == maze_max_cols
     
     # n_cols for the maze is constant fixed to maze_height
-    NUM_ROWS = 10
+    NUM_ROWS = 2
     NUM_COLS = 5
     # y <=> cols & x <=> rows
     # debug: flat ground plane terrain
@@ -168,8 +169,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         max_init_terrain_level=1,
         terrain_generator=make_maze_terrain_cfg(
             cell_size=2.0,
-            maze_max_cols=5.0,
-            maze_max_rows=10.0,
+            maze_max_cols=NUM_COLS,
+            maze_max_rows=NUM_ROWS,
             terrain_num_rows=NUM_ROWS,
             terrain_num_cols=NUM_COLS,
             p_wall_dest=0.3,
@@ -241,8 +242,9 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     goal_marker_cfg = VisualizationMarkersCfg(
         prim_path="/Visuals/GoalMarkers",
         markers={
-            "goal": sim_utils.SphereCfg(
-                radius=1.0,
+            "goal": sim_utils.UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                scale=(0.5, 0.5, 0.5),
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
             ),
         },
