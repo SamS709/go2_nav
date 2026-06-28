@@ -563,8 +563,45 @@ def maze_terrain(
     # Robot spawn origin is the center of a reserved maze cell.
     spawn_row, spawn_col = spawn_cell
     origin = np.array([offset_x + (spawn_col + 0.5) * cell_w, offset_y + (spawn_row + 0.5) * cell_h, 0.0])
-    return meshes, origin
 
+    # --- IsaacLab axis convention fix -------------------------------------------------
+    # Everything above builds the maze with `row` driving the y-extent and `col` driving
+    # the x-extent (so curriculum difficulty, which scales maze_rows, grows the maze along
+    # y). IsaacLab's terrain convention expects rows -> x, cols -> y. Rather than touching
+    # any of the generation logic above (walls, stairs, boxes, roughness, floor holes -
+    # all of which are internally self-consistent), rotate the finished tile 90 degrees
+    # about its own center so the net effect is row -> x, col -> y, with no change to mesh
+    # winding/normals (a rotation, unlike a raw x<->y swap, preserves handedness).
+    #
+    # This rotation only preserves the tile footprint when the tile is square; a
+    # non-square tile would have its footprint rotated too, breaking alignment with
+    # neighboring tiles. Fail loudly rather than silently misalign.
+    if not np.isclose(cfg.size[0], cfg.size[1]):
+        raise ValueError(
+            "maze_terrain's axis-convention fix assumes a square tile "
+            f"(cfg.size[0] == cfg.size[1]); got size={cfg.size}."
+        )
+
+    cx_tile = 0.5 * cfg.size[0]
+    cy_tile = 0.5 * cfg.size[1]
+
+    def _rotate90_xy(points: np.ndarray) -> np.ndarray:
+        # Rotate (x, y) by -90 degrees about the tile center: (x, y) -> (y, -x), then
+        # re-center. This maps "what used to vary with col (x)" to vary with y, and
+        # "what used to vary with row (y)" to vary with x.
+        out = points.copy()
+        x = points[..., 0] - cx_tile
+        y = points[..., 1] - cy_tile
+        out[..., 0] = y + cx_tile
+        out[..., 1] = -x + cy_tile
+        return out
+
+    for mesh in meshes:
+        mesh.vertices = _rotate90_xy(mesh.vertices)
+
+    origin = _rotate90_xy(origin)
+
+    return meshes, origin
 
 @configclass
 class MeshMazeTerrainCfg(SubTerrainBaseCfg):
