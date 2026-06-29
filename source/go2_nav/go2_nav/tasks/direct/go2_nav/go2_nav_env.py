@@ -64,31 +64,7 @@ class Go2NavEnv(DirectRLEnv):
         self.low_level_joint_targets = self.robot.data.default_joint_pos.clone()
 
         self._init_goals_and_starts()
-
-        self._lidar_x_cells = max(
-            1, int((float(self.cfg.lidar_x_range[1]) - float(self.cfg.lidar_x_range[0])) / float(self.cfg.lidar_cell_size))
-        )
-        self._lidar_y_cells = max(
-            1, int((float(self.cfg.lidar_y_range[1]) - float(self.cfg.lidar_y_range[0])) / float(self.cfg.lidar_cell_size))
-        )
-        self._lidar_num_cells = self._lidar_x_cells * self._lidar_y_cells
-        self._latest_lidar_obs = torch.zeros(self.num_envs, self._lidar_num_cells, device=self.device)
-
-        self._lidar_x_cells_loc = max(
-            1,
-            int(
-                (float(self.cfg.x_range[1]) - float(self.cfg.x_range[0]))
-                / float(self.cfg.res)
-            ),
-        )
-        self._lidar_y_cells_loc = max(
-            1,
-            int(
-                (float(self.cfg.y_range[1]) - float(self.cfg.y_range[0]))
-                / float(self.cfg.res)
-            ),
-        )
-        self._lidar_num_cells_loc = self._lidar_x_cells_loc * self._lidar_y_cells_loc
+        
 
         self._finite_warn_counter = 0
         self.locomotion_policy = self._load_locomotion_policy(self.cfg.locomotion_policy_path)
@@ -108,6 +84,34 @@ class Go2NavEnv(DirectRLEnv):
         self.start_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
         self._update_starts(all_env_ids, center=True)
         
+    def _setup_lidar_values(self):
+        self.nav_inv_cell_size = 1.0 / float(self.cfg.nav_cell_size)
+        self.nav_x_cells = max(
+            1, int((float(self.cfg.nav_x_range[1]) - float(self.cfg.nav_x_range[0])) * self.nav_inv_cell_size )
+        )
+        self.nav_y_cells = max(
+            1, int((float(self.cfg.nav_y_range[1]) - float(self.cfg.nav_y_range[0])) * self.nav_inv_cell_size )
+        )
+        self.nav_num_cells = self.nav_x_cells * self.nav_y_cells
+        self._latest_lidar_obs = torch.zeros(self.num_envs, self.nav_num_cells, device=self.device)
+        
+        self.loc_inv_cell_size = 1.0 / float(self.cfg.loc_cell_size)
+        self.loc_x_cells = max(
+            1,
+            int(
+                (float(self.cfg.loc_x_range[1]) - float(self.cfg.loc_x_range[0]))
+                * self.loc_inv_cell_size
+            ),
+        )
+        self.loc_y_cells = max(
+            1,
+            int(
+                (float(self.cfg.loc_y_range[1]) - float(self.cfg.loc_y_range[0]))
+                * self.loc_inv_cell_size
+            ),
+        )
+        self.loc_num_cells = self.loc_x_cells * self.loc_y_cells
+        
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
@@ -115,9 +119,8 @@ class Go2NavEnv(DirectRLEnv):
 
         self._height_scanner = self.cfg.height_scanner.class_type(self.cfg.height_scanner)
         self.scene.sensors["height_scanner"] = self._height_scanner
-        x_cells = max(1, int((self.cfg.x_range[1] - self.cfg.x_range[0]) / self.cfg.res))
-        y_cells = max(1, int((self.cfg.y_range[1] - self.cfg.y_range[0]) / self.cfg.res))
-        self._create_gaussian_heightmap(x_cells, y_cells)
+        self._setup_lidar_values()
+        self._create_gaussian_heightmap(self.loc_x_cells, self.loc_y_cells)
         
         self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
         self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
@@ -203,7 +206,7 @@ class Go2NavEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         lidar_obs = self._compute_height_data_from_cloud(locomotion=False)
-        height_scan = lidar_obs.reshape(self.num_envs, 1, self._lidar_x_cells, self._lidar_y_cells)
+        height_scan = lidar_obs.reshape(self.num_envs, 1, self.nav_x_cells, self.nav_y_cells)
 
         student_proprio = self.predicted_pos_history.reshape(self.num_envs, -1)
 
@@ -400,16 +403,14 @@ class Go2NavEnv(DirectRLEnv):
         joint_pos_rel = self.robot.data.joint_pos - self.robot.data.default_joint_pos
         joint_vel = self.robot.data.joint_vel
         
-        x_cells = max(1, int((float(self.cfg.x_range[1]) - float(self.cfg.x_range[0])) / float(self.cfg.res)))
-        y_cells = max(1, int((float(self.cfg.y_range[1]) - float(self.cfg.y_range[0])) / float(self.cfg.res)))
         # height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize)
         height_data = self._compute_height_data_from_cloud(randomize=True)
-        height_data = height_data.view(self.num_envs, x_cells, y_cells).flip(dims=[1]).unsqueeze(1)
+        height_data = height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).unsqueeze(1)
         # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        # cell_size_m = float(self.cfg.res)
+        # cell_size_m = float(self.cfg.loc_cell_size)
         # inv_cell_size = 1.0 / cell_size_m
-        # x_min, x_max = float(self.cfg.x_range[0]), float(self.cfg.x_range[1])
-        # y_min, y_max = float(self.cfg.y_range[0]), float(self.cfg.y_range[1])
+        # x_min, x_max = float(self.cfg.loc_x_range[0]), float(self.cfg.loc_x_range[1])
+        # y_min, y_max = float(self.cfg.loc_y_range[0]), float(self.cfg.loc_y_range[1])
         # print(height_data_student.reshape(int((x_max - x_min)*inv_cell_size),int((y_max - y_min)*inv_cell_size)))
         
         # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))            
@@ -480,13 +481,20 @@ class Go2NavEnv(DirectRLEnv):
         if randomize and hasattr(self, "_rots"):
             rays_lidar = self._apply_yaw_rotation(rays_lidar)
 
-        cell_size_m = float(self.cfg.res)
-        inv_cell_size = 1.0 / cell_size_m
-        x_min, x_max = float(self.cfg.x_range[0]), float(self.cfg.x_range[1])
-        y_min, y_max = float(self.cfg.y_range[0]), float(self.cfg.y_range[1])
-        x_cells = max(1, int((x_max - x_min) / cell_size_m))
-        y_cells = max(1, int((y_max - y_min) / cell_size_m))
-        num_cells = x_cells * y_cells
+        if locomotion:
+            x_cells = self.loc_x_cells
+            y_cells = self.loc_y_cells
+            inv_cell_size = self.loc_inv_cell_size            
+            x_min = float(self.cfg.loc_x_range[0])
+            y_min = float(self.cfg.loc_y_range[0])
+            num_cells = self.loc_num_cells            
+        else:
+            x_cells = self.nav_x_cells
+            y_cells = self.nav_y_cells
+            inv_cell_size = self.nav_inv_cell_size
+            x_min = float(self.cfg.nav_x_range[0])
+            y_min = float(self.cfg.nav_y_range[0])
+            num_cells = self.nav_num_cells
 
         rays_flat = rays_lidar.reshape(-1, 3)
         env_ids = torch.arange(num_envs, device=self.device).unsqueeze(1).expand(num_envs, num_rays).reshape(-1)
@@ -526,66 +534,6 @@ class Go2NavEnv(DirectRLEnv):
         # Keep ordering consistent with lidar_debug flow.
         return height_map
     
-    def _compute_lidar_height_map(self, locomotion) -> torch.Tensor:
-        data = self._height_scanner.data
-        ray_hits_w = data.ray_hits_w
-        lidar_pos_w = data.pos_w
-        lidar_quat_w = data.quat_w
-
-        num_envs, num_rays, _ = ray_hits_w.shape
-        rays_rel_w = ray_hits_w - lidar_pos_w.unsqueeze(1)
-        rays_lidar = quat_apply(
-            quat_conjugate(lidar_quat_w).unsqueeze(1).expand(num_envs, num_rays, 4).reshape(-1, 4),
-            rays_rel_w.reshape(-1, 3),
-        ).reshape(num_envs, num_rays, 3)
-        
-        if locomotion:
-            cell_size = float(self.cfg.res)
-            inv_cell_size = 1.0 / cell_size
-            x_min, x_max = float(self.cfg.x_range[0]), float(self.cfg.x_range[1])
-            y_min, y_max = float(self.cfg.y_range[0]), float(self.cfg.y_range[1])
-            x_cells = self._lidar_x_cells_loc
-            y_cells = self._lidar_y_cells_loc
-            num_cells = x_cells * y_cells
-
-        else:
-            cell_size = float(self.cfg.lidar_cell_size)
-            inv_cell_size = 1.0 / cell_size
-            x_min, x_max = float(self.cfg.lidar_x_range[0]), float(self.cfg.lidar_x_range[1])
-            y_min, y_max = float(self.cfg.y_range[0]), float(self.cfg.y_range[1])
-            x_cells = self._lidar_x_cells
-            y_cells = self._lidar_y_cells
-            num_cells = x_cells * y_cells
-
-        rays_flat = rays_lidar.reshape(-1, 3)
-        env_ids = torch.arange(num_envs, device=self.device).unsqueeze(1).expand(num_envs, num_rays).reshape(-1)
-
-        valid = torch.isfinite(rays_flat).all(dim=1)
-        if not torch.any(valid):
-            return torch.zeros((num_envs, num_cells), device=self.device)
-
-        rays_valid = rays_flat[valid]
-        env_ids = env_ids[valid]
-
-        x_idx = torch.floor((rays_valid[:, 0] - x_min) * inv_cell_size).long()
-        y_idx = torch.floor((rays_valid[:, 1] - y_min) * inv_cell_size).long()
-        in_bounds = (x_idx >= 0) & (x_idx < x_cells) & (y_idx >= 0) & (y_idx < y_cells)
-        if not torch.any(in_bounds):
-            return torch.zeros((num_envs, num_cells), device=self.device)
-
-        x_idx = x_idx[in_bounds]
-        y_idx = y_idx[in_bounds]
-        env_ids = env_ids[in_bounds]
-        z_vals = rays_valid[in_bounds, 2]
-
-        flat_idx = env_ids * num_cells + x_idx * y_cells + y_idx
-        height_map = torch.full((num_envs * num_cells,), -torch.inf, device=self.device)
-        height_map.scatter_reduce_(0, flat_idx, z_vals, reduce="amax", include_self=True)
-        height_map = torch.where(torch.isfinite(height_map), -height_map, torch.zeros_like(height_map))
-        height_map = height_map.reshape(num_envs, num_cells)
-
-        return self._sanitize_tensor(height_map, "lidar_obs", clamp_abs=10.0)
-
     def _get_true_odom_r(self) -> torch.Tensor:
         root_lin_vel = getattr(self.robot.data, "root_lin_vel_w", self.robot.data.root_lin_vel_b)
         root_ang_vel = getattr(self.robot.data, "root_ang_vel_w", self.robot.data.root_ang_vel_b)

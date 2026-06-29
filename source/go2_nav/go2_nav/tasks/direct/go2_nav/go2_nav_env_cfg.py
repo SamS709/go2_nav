@@ -99,13 +99,14 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     episode_length_s = 30.0
     # Planner output: [x, y, z, vx, vy, vz, wx, wy, wz, cmd_x, cmd_y, cmd_z]
     action_space = 12
-    lidar_cell_size = 0.2
-    lidar_x_range = (-0.5, 10.0)
-    lidar_y_range = (-10.0, 10.0)
+    nav_cell_size = 0.2
+    nav_x_range = (-0.5, 10.0)
+    nav_y_range = (-10.0, 10.0)
     
-    res = 0.1
-    x_range = [-0.5, 0.8]
-    y_range = [-0.5, 0.5]
+    loc_cell_size = 0.1
+    loc_x_range = [-0.5, 0.8]
+    loc_y_range = [-0.5, 0.5]
+    
     sigma = 4.00
     n_zeros = 20
     max_reset_zeros_freq = 8
@@ -115,8 +116,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     desired_base_height = 0.28
 
     planner_history_len = 100
-    lidar_num_cells = int((lidar_x_range[1] - lidar_x_range[0]) / lidar_cell_size) * int(
-        (lidar_y_range[1] - lidar_y_range[0]) / lidar_cell_size
+    lidar_num_cells = int((nav_x_range[1] - nav_x_range[0]) / nav_cell_size) * int(
+        (nav_y_range[1] - nav_y_range[0]) / nav_cell_size
     )
     observation_space = lidar_num_cells + planner_history_len * 3
     # Teacher receives student obs + privileged terms.
