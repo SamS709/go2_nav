@@ -22,6 +22,35 @@ from labyrinth.grid import Direction
 from labyrinth.maze import Maze
 
 
+class _MazeRegistry:
+    """Side-channel storing maze layouts keyed by (terrain_generator_id, row, col)."""
+    def __init__(self):
+        self._mazes: list[np.ndarray] = [] 
+        self._terrain_num_cols: int
+        self._terrain_num_rows: int
+        
+    def set_dims(self, terrain_rows, terrain_cols):
+        self._terrain_num_rows, self._terrain_num_cols = terrain_rows, terrain_cols
+        
+
+    def record(self, maze_array: np.ndarray):
+        self._mazes.append(maze_array)
+        
+    def maze_at(self, row: int, col: int) -> np.ndarray:
+        """Reassemble into (num_rows, num_cols, ...) using TerrainGenerator's known call order."""
+        # TerrainGenerator iterates row-major (sub_terrains call order); see step (c) for the
+        # exact assumption here and why it's safe.
+        # 0,1 = 1 // 1, 1 = 4 (car terrain num_cols = 3)
+        return self._mazes[row * self._terrain_num_cols + col]
+    
+    def as_list(self) -> list:
+        return self._mazes
+    
+    
+   
+
+MAZE_REGISTRY = _MazeRegistry()
+
 def _make_generator(name: str):
     """Create the requested maze generator."""
     if name == "dfs":
@@ -397,12 +426,29 @@ def maze_terrain(
     max_cell_span = min(cell_w, cell_h)
     boxes_patch_size = max_cell_span * max(0.1, min(1.0, sampled_boxes_patch_size_ratio))
     rough_patch_size = max_cell_span * max(0.1, min(1.0, sampled_rough_patch_size_ratio))
+    
+    # maze_array[row, col, 0] -> terrain_type in [0,1,2,3,4]:
+    #   - 0 -> flat
+    #   - 1 -> stairs
+    #   - 2 -> boxes
+    #   - 3 -> grid
+    #   - 1 -> stairs
+    # maze_array[row, col, 1] -> North wall in [0,1] 1 if exixts else 0
+    # maze_array[row, col, 2] -> North wall in [0,1] 1 if exixts else 0
+    # maze_array[row, col, 3] -> North wall in [0,1] 1 if exixts else 0
+    # maze_array[row, col, 4] -> North wall in [0,1] 1 if exixts else 0
+    maze_array = np.zeros((maze_rows, maze_cols, 5))
+    
+    
 
     for row in range(maze_rows):
         for col in range(maze_cols):
             cell = maze.get_cell(row, col)
             cx = offset_x + (col + 0.5) * cell_w
             cy = offset_y + (row + 0.5) * cell_h
+            
+            # ===========================================================================
+            # WALLS 
             # North wall
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
             if Direction.N not in cell.open_walls and not dest_wall_cond:
@@ -412,6 +458,29 @@ def maze_terrain(
                         (cx, offset_y + row * cell_h, 0.5 * wall_height),
                     )
                 )
+                maze_array[row, col, 1] = 1
+                
+            # East boundary
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
+            if col == maze_cols - 1 and Direction.E not in cell.open_walls and not dest_wall_cond:
+                meshes.append(
+                    _box_mesh(
+                        (wall_thickness, cell_h + wall_thickness, wall_height),
+                        (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
+                    )
+                )
+                maze_array[row, col, 2] = 1
+                
+            # South boundary
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
+            if row == maze_rows - 1 and Direction.S not in cell.open_walls and not dest_wall_cond:
+                meshes.append(
+                    _box_mesh(
+                        (cell_w + wall_thickness, wall_thickness, wall_height),
+                        (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
+                    )
+                )
+                maze_array[row, col, 3] = 1
 
             # West wall
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
@@ -422,28 +491,11 @@ def maze_terrain(
                         (offset_x + col * cell_w, cy, 0.5 * wall_height),
                     )
                 )
+                maze_array[row, col, 4] = 1
 
-            # South boundary
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
-            if row == maze_rows - 1 and Direction.S not in cell.open_walls and not dest_wall_cond:
-                meshes.append(
-                    _box_mesh(
-                        (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
-                    )
-                )
-
-            # East boundary
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
-            if col == maze_cols - 1 and Direction.E not in cell.open_walls and not dest_wall_cond:
-                meshes.append(
-                    _box_mesh(
-                        (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
-                    )
-                )
-
-            # Stairs only in straight corridor cells with two parallel walls.
+            # ===========================================================================
+            # STAIRS 
+            # only in straight corridor cells with two parallel walls.
             stairs_dir = _corridor_stairs_direction(cell.open_walls)
             if (row, col) != spawn_cell and stairs_dir is not None and rng.random() < stairs_prob:
                 start_down = rng.random() < cfg.stairs_start_down_prob
@@ -480,14 +532,16 @@ def maze_terrain(
                     max_rows=stair_total_width,
                 )
                 stairs_cells.add((row, col))
+                
                 hole_margin = max(0.0, cfg.stairs_hole_margin)
                 stairs_footprints[(row, col)] = (
                     stairs_dir,
                     footprint[0] + 2.0 * hole_margin,
                     footprint[1] + 2.0 * hole_margin,
                 )
-
-            # Boxes patch in cell.
+                maze_array[row, col, 0] = 1
+            # ===========================================================================
+            # BOXES
             if (row, col) != spawn_cell and (row, col) not in stairs_cells and rng.random() < boxes_prob:
                 _append_boxes_meshes(
                     meshes=meshes,
@@ -499,8 +553,9 @@ def maze_terrain(
                     min_size=cfg.boxes_min_size,
                 )
                 boxes_cells.add((row, col))
+                maze_array[row, col, 0] = 2
 
-            # Roughness patch in cell.
+            # GRIDS
             if (
                 (row, col) != spawn_cell
                 and (row, col) not in stairs_cells
@@ -517,8 +572,10 @@ def maze_terrain(
                     h_rough_z=sampled_rough_h_rough_z,
                     min_size=cfg.rough_min_size,
                 )
-
-    # Optional floor with stair holes.
+                maze_array[row, col, 0] = 3
+    # ===========================================================================
+    # FLOORS
+    # no floor if there is stairs
     if cfg.floor_thickness > 0.0:
         for row in range(maze_rows):
             for col in range(maze_cols):
@@ -600,6 +657,8 @@ def maze_terrain(
         mesh.vertices = _rotate90_xy(mesh.vertices)
 
     origin = _rotate90_xy(origin)
+    
+    MAZE_REGISTRY.record(maze_array)
 
     return meshes, origin
 

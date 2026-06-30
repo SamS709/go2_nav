@@ -20,6 +20,9 @@ from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg, MultiMeshRayCasterCfg, RayCasterCfg, patterns
 from isaaclab.markers import VisualizationMarkersCfg
 
+from dataclasses import MISSING
+
+
 from go2_nav.maze_terrain_cfg import make_maze_terrain_cfg  # isort: skip
 
 @configclass
@@ -147,7 +150,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Same for NUM_COLS == maze_max_cols
     
     # n_cols for the maze is constant fixed to maze_height
-    NUM_ROWS = 2
+    NUM_ROWS = 3
     NUM_COLS = 5
     # y <=> cols & x <=> rows
     # debug: flat ground plane terrain
@@ -164,7 +167,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     #     ),
     #     debug_vis=False,
     # )
-    terrain = TerrainImporterCfg(
+    terrain: TerrainImporterCfg = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
         max_init_terrain_level=1,
