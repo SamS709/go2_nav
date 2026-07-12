@@ -1,0 +1,8 @@
+To check
+- registering pos freuency
+
+Checked:
+
+- rows <=> x & cols <=> y
+- mazes in MAZE_REGISTER are oriented registered to correspond to the displayed maze in the sim for x (or rows) increasing.
+- 

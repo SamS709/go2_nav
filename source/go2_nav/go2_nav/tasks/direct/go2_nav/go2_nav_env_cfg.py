@@ -99,6 +99,9 @@ class EventCfg:
 class Go2NavEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 4
+    sim_freq = 200
+    policy_freq = sim_freq / 4
+    sim_dt = 1 / sim_freq
     episode_length_s = 30.0
     # Planner output: [x, y, z, vx, vy, vz, wx, wy, wz, cmd_x, cmd_y, cmd_z]
     action_space = 12
@@ -117,12 +120,19 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     max_offset = 0.05
     
     desired_base_height = 0.28
-
-    planner_history_len = 100
+    
+    # positions buffer
+    length_mid_term: int = 50
+    length_long_term: int = 50
+    freq_pos_mid_term: float = 1 # (policy_tick^(⁻1)) 50 recordings every 1 policy tick
+    freq_pos_long_term: float = 0.1 # (policy_tick^(⁻1)) 50 recordings every 10 policy_tick  
+    interval_pos_mid_term: float = 1 / freq_pos_mid_term
+    interval_pos_long_term: float = 1 / freq_pos_long_term
+    
     lidar_num_cells = int((nav_x_range[1] - nav_x_range[0]) / nav_cell_size) * int(
         (nav_y_range[1] - nav_y_range[0]) / nav_cell_size
     )
-    observation_space = lidar_num_cells + planner_history_len * 3
+    observation_space = lidar_num_cells + (length_mid_term + length_long_term) * 3
     # Teacher receives student obs + privileged terms.
     teacher_observation_space = observation_space + 17
     # Expose critic state-space as privileged teacher observations for asymmetric PPO.
@@ -132,7 +142,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # events: EventCfg = EventCfg()
     # simulation
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 200,
+        dt=sim_dt,
         render_interval=decimation,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -150,8 +160,10 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Same for NUM_COLS == maze_max_cols
     
     # n_cols for the maze is constant fixed to maze_height
-    NUM_ROWS = 3
-    NUM_COLS = 5
+    NUM_ROWS = 4
+    NUM_COLS = 1
+    MAX_MAZE_ROWS = 8
+    MAX_MAZE_COLS = 4
     # y <=> cols & x <=> rows
     # debug: flat ground plane terrain
     # terrain = TerrainImporterCfg(
@@ -173,8 +185,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         max_init_terrain_level=1,
         terrain_generator=make_maze_terrain_cfg(
             cell_size=2.0,
-            maze_max_cols=NUM_COLS,
-            maze_max_rows=NUM_ROWS,
+            maze_max_cols=MAX_MAZE_COLS,
+            maze_max_rows=MAX_MAZE_ROWS,
             terrain_num_rows=NUM_ROWS,
             terrain_num_cols=NUM_COLS,
             p_wall_dest=0.3,
@@ -195,7 +207,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             stairs_step_depth_range=(0.18, 0.24),
             stairs_num_steps_range=(2, 15),
             stairs_start_down_prob=0.4,
-            boxes_n_boxes_range=(2, 3),
+            boxes_n_boxes_range=(10, 20),
             boxes_h_boxes_range=(0.10, 0.20),
             boxes_patch_size_ratio_range=(0.75, 0.90),
             rough_n_rough_range=(16, 36),
@@ -265,12 +277,25 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         },
     )
     
+    env_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/envMarkers",
+        markers={
+            "env": sim_utils.UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                scale=(0.5, 0.5, 0.5),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
+            ),
+        },
+    )
+    
     # planner -> locomotion policy interface
     locomotion_policy_path = "policies/policy_cnn_rnn_seq3.pt"
     require_locomotion_policy = True
     locomotion_observation_dim = 195
     locomotion_action_scale = 0.25
     locomotion_cmd_limits = (1.5, 1.0, 1.5)
+    
+      
 
     # goal and reward settings
     rew_scale_goal_distance = 3.0

@@ -114,6 +114,12 @@ def overwrite_python_analysis_extra_paths(isaaclab_settings: str) -> str:
     isaaclab_extensions = os.listdir(os.path.join(PROJECT_DIR, "source"))
     path_names.extend(['"${workspaceFolder}/source/' + ext + '"' for ext in isaaclab_extensions])
 
+    # add the sibling Isaac Lab checkout if this repo is opened alongside it
+    for sibling_repo in ("isaaclab_classic", "isaaclab"):
+        sibling_source_dir = os.path.join(PROJECT_DIR, "..", sibling_repo, "source")
+        if os.path.exists(sibling_source_dir):
+            path_names.append(f'"${{workspaceFolder}}/../{sibling_repo}/source"')
+
     # combine them into a single string
     path_names = ",\n\t\t".expandtabs(4).join(path_names)
     # deal with the path separator being different on Windows and Unix

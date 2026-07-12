@@ -17,24 +17,31 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 from isaaclab.markers import VisualizationMarkers
-from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.terrains import TerrainImporterCfg ,TerrainImporter
 
 
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
+from .utils import env_ids_to_terrain_coords
 
 class Go2NavEnv(DirectRLEnv):
     cfg: Go2NavEnvCfg
 
     def __init__(self, cfg: Go2NavEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+        self.tick_count_env: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
+        self.period_hist_mid_term = max(1, int(round(1 / self.cfg.freq_pos_mid_term)))
+        self.period_hist_long_term = max(1, int(round(1 / self.cfg.freq_pos_long_term)))
+        self.all_env_ids: torch.Tensor = torch.arange(self.num_envs, device=self.device)
         self._base_id_sensor, _base_name = self._contact_sensor.find_bodies("base")
         self._feet_ids_sensor, _feet_name = self._contact_sensor.find_bodies(".*_foot")
         self._thigh_ids_sensor, _thigh_name = self._contact_sensor.find_bodies(".*_thigh")
         self._hip_ids_sensor, _hip_name = self._contact_sensor.find_bodies(".*_hip")
         self._calf_ids_sensor, _calf_name = self._contact_sensor.find_bodies(".*_calf")
-        MAZE_REGISTRY.set_dims(self.cfg.NUM_ROWS, self.cfg.NUM_COLS)
+        MAZE_REGISTRY.set_dims(self.cfg.NUM_ROWS, self.cfg.NUM_COLS, self.cfg.MAX_MAZE_ROWS, self.cfg.MAX_MAZE_COLS,self.device)
         self.maze_registery = MAZE_REGISTRY
+        terrain_coords: torch.Tensor = env_ids_to_terrain_coords(self.all_env_ids, self._terrain)
+        self.mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(terrain_coords).clone()
         self._base_id, _ = self._robot.find_bodies("base")
         self._feet_ids, _ = self._robot.find_bodies(".*_foot")
         self._thigh_ids, _ = self._robot.find_bodies(".*_thigh")
@@ -50,23 +57,26 @@ class Go2NavEnv(DirectRLEnv):
         # [^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^][^^^^^^^^^^^^^]
         # [              ODOM             ][   VEL CMDS  ]
 
-        self.pred_odom = torch.zeros(self.num_envs, 9, device=self.device)
-        self.cmd_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.pred_odom: torch.Tensor = torch.zeros(self.num_envs, 9, device=self.device)
+        self.cmd_vel: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
 
         action_dim = int(self.cfg.action_space)
         self._num_joints = int(self._robot.data.default_joint_pos.shape[-1])
 
 
-        self.predicted_odom = torch.zeros(self.num_envs, 9, device=self.device)
-        self.predicted_pos_history = torch.zeros(
-            self.num_envs, int(self.cfg.planner_history_len), 3, device=self.device
+        self.predicted_odom: torch.Tensor = torch.zeros(self.num_envs, 9, device=self.device)
+        self.pred_pos_hist_mid_term = torch.zeros(
+            self.num_envs, int(self.cfg.length_mid_term), 3, device=self.device
+        )
+        self.pred_pos_hist_long_term = torch.zeros(
+            self.num_envs, int(self.cfg.length_long_term), 3, device=self.device
         )
 
-        self.cmd_vel = torch.zeros(self.num_envs, 3, device=self.device)
-        self.prev_cmd_vel = torch.zeros_like(self.cmd_vel)
+        self.cmd_vel: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
+        self.prev_cmd_vel: torch.Tensor = torch.zeros_like(self.cmd_vel)
 
-        self.loc_actions = torch.zeros(self.num_envs, self._num_joints, device=self.device)
-        self.prev_loc_actions = torch.zeros_like(self.loc_actions)
+        self.loc_actions: torch.Tensor = torch.zeros(self.num_envs, self._num_joints, device=self.device)
+        self.prev_loc_actions: torch.Tensor = torch.zeros_like(self.loc_actions)
         self.low_level_joint_targets = self._robot.data.default_joint_pos.clone()
 
         self._init_goals_and_starts()
@@ -97,19 +107,20 @@ class Go2NavEnv(DirectRLEnv):
         return policy
         
     def _init_goals_and_starts(self):
-        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        all_env_ids: torch.Tensor = torch.arange(self.num_envs, device=self.device)
         #goals
-        self.goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self.goal_yaw_w = torch.zeros(self.num_envs, device=self.device)
-        self.goal_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
-        self.prev_goal_distance = torch.zeros(self.num_envs, device=self.device)
-        self.goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._update_goals(all_env_ids, center=True)
+        self.goal_pos_w: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
+        self.goal_yaw_w: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
+        self.goal_quat_w: torch.Tensor = torch.zeros(self.num_envs, 4, device=self.device)
+        self.prev_goal_distance: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
+        self.goal_reached: torch.Tensor = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.num_goal_maze_marker: int = self.maze_registery.num_terrain_types        
+        self._update_goals(all_env_ids, center=False)
         # starts
-        self.start_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self.start_yaw_w = torch.zeros(self.num_envs, device=self.device)
-        self.start_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
-        self._update_starts(all_env_ids, center=True)
+        self.start_pos_w: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
+        self.start_yaw_w: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
+        self.start_quat_w: torch.Tensor = torch.zeros(self.num_envs, 4, device=self.device)
+        self._update_starts(all_env_ids, center=False)
         
         
     def _setup_scene(self):
@@ -124,6 +135,8 @@ class Go2NavEnv(DirectRLEnv):
         
         self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
         self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
+        self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
+        
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -206,11 +219,21 @@ class Go2NavEnv(DirectRLEnv):
         self.low_level_joint_targets = (
             self._robot.data.default_joint_pos + self.cfg.locomotion_action_scale * self.loc_actions
         )
+        self.tick_count_env += 1
         
 
     def _update_predicted_position_history(self, predicted_xyz: torch.Tensor) -> None:
-        self.predicted_pos_history = torch.roll(self.predicted_pos_history, shifts=-1, dims=1)
-        self.predicted_pos_history[:, -1, :] = predicted_xyz
+        # mid_term history
+        should_update = (self.tick_count_env % self.period_hist_mid_term == 0)  # (num_envs,) bool
+
+        # Roll the full buffer, then selectively keep old or new values
+        rolled = torch.roll(self.pred_pos_hist_mid_term, shifts=-1, dims=1)
+        rolled[:, -1, :] = predicted_xyz
+
+        # should_update: (num_envs,) -> unsqueeze to (num_envs, 1, 1) for broadcasting
+        mask = should_update[:, None, None]
+        self.pred_pos_hist_mid_term = torch.where(mask, rolled, self.pred_pos_hist_mid_term)
+        # print(self.pred_pos_hist_mid_term)
 
     def _query_locomotion_policy(self, locomotion_obs: torch.Tensor, height_data_loc: torch.Tensor) -> torch.Tensor:
         with torch.inference_mode():
@@ -272,16 +295,26 @@ class Go2NavEnv(DirectRLEnv):
         height_data_student = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=False)
         height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         height_data_student = height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
-        
-        student_proprio = self.predicted_pos_history.reshape(self.num_envs, -1)
+        goal_xy_s = self._get_goal_pos_s()[:,:-1]
+        print(goal_xy_s)
+        student_proprio = self.pred_pos_hist_mid_term.reshape(self.num_envs, -1)
+        student_proprio = torch.cat([student_proprio, goal_xy_s[:,:1]], dim=-1)
 
         true_odom = self._get_true_odom_r()
         goal_delta = self.goal_pos_w - self._robot.data.root_pos_w
         yaw_error = self._wrap_to_pi(self.goal_yaw_w - self._quat_to_yaw(self._robot.data.root_quat_w))
         goal_heading = torch.stack((torch.sin(yaw_error), torch.cos(yaw_error)), dim=-1)
 
+        
+        terrain_type = self.mazes[:,:,:,0].long()
+        maze_encoded = torch.nn.functional.one_hot(terrain_type, self.maze_registery.num_terrain_types)
+        maze_remaining = self.mazes[:,:,:,1:] 
+        maze_encoded_flat = maze_encoded.reshape(self.num_envs, -1)
+        maze_remaining_flat = maze_remaining.reshape(self.num_envs, -1)
+        maze_features = torch.cat([maze_encoded_flat, maze_remaining_flat], dim=-1)
+
         teacher_proprio = torch.cat(
-            [student_proprio, true_odom, goal_delta, goal_heading, self.cmd_vel],
+            [student_proprio.clone(), true_odom, goal_delta, goal_heading, self.cmd_vel, maze_features],
             dim=-1,
         )
 
@@ -297,10 +330,22 @@ class Go2NavEnv(DirectRLEnv):
             "teacher_height_scan": teacher_height_scan,
         }
         
+                
+    
     def log_infos(self):
         mazes_array = self.maze_registery.as_list()
-        for i in range(3):
-            print(f"\nMAZE at ind {i}\n", mazes_array[i][:,:,0])
+        n = 3
+        self.env_markers.visualize(
+            translations=self._robot.data.root_pos_w[n].unsqueeze(0),
+            orientations=self._robot.data.root_quat_w[n].unsqueeze(0),
+        )
+        terrain_coords = env_ids_to_terrain_coords(self.all_env_ids, self._terrain)
+        # print(terrain_coords[n])
+        # print(self.mazes[n, :, :, 0])
+        # num_rows=self.maze_registery.get_num_rows(terrain_coords)
+        # print(num_rows[n])
+        # maze_encoded = torch.nn.functional.one_hot(self.mazes[:,:,:,0].long(), self.maze_registery.num_terrain_types + 1)
+        print(self.pred_pos_hist_mid_term[3])
 
     def _get_rewards(self) -> torch.Tensor:
         terrain_cfg = self.cfg.terrain.terrain_generator
@@ -395,6 +440,8 @@ class Go2NavEnv(DirectRLEnv):
             move_down = self.reset_terminated[env_ids_tensor] & ~move_up
 
         super()._reset_idx(env_ids_tensor)
+        
+        self.tick_count_env[env_ids_tensor] = 0
 
         if move_up is not None and move_down is not None:
             self._terrain.update_env_origins(env_ids_tensor, move_up, move_down)
@@ -406,7 +453,7 @@ class Go2NavEnv(DirectRLEnv):
         default_root_state[:, :3] += self._terrain.env_origins[env_ids_tensor]
 
         self.predicted_odom[env_ids_tensor] = 0.0
-        self.predicted_pos_history[env_ids_tensor] = 0.0
+        self.pred_pos_hist_mid_term[env_ids_tensor] = 0.0
         self.cmd_vel[env_ids_tensor] = 0.0
         self.prev_cmd_vel[env_ids_tensor] = 0.0
         self.loc_actions[env_ids_tensor] = 0.0
@@ -539,6 +586,8 @@ class Go2NavEnv(DirectRLEnv):
             dim=-1,
         )
 
+    def _get_goal_pos_s(self) -> torch.Tensor:
+        return self.goal_pos_w - self.start_pos_w
 
     def _update_goals(self, env_ids: torch.Tensor, center: bool = False) -> None:
         """Update goal positions for the given envs.
@@ -555,14 +604,15 @@ class Go2NavEnv(DirectRLEnv):
         maze_cfg = terrain_generator.sub_terrains["maze"]
         cell_size = float(maze_cfg.cell_size)
 
-        max_rows = max(1, int(round(maze_cfg.maze_max_rows)))
         max_cols = max(1, int(round(maze_cfg.maze_max_cols)))
+        
 
         # Per-env curriculum level (0-indexed). Levels 0 & 1 -> 1 row; level k (k>=2) -> k rows.
-        levels = self._terrain.terrain_levels[env_ids].to(dtype=torch.long)
-        maze_rows = torch.clamp(levels, min=1, max=max_rows)
+        terrain_coords = env_ids_to_terrain_coords(env_ids, self._terrain)
+        maze_rows = self.maze_registery.get_num_rows(terrain_coords)
         maze_cols = torch.full_like(maze_rows, max_cols)
-
+        
+    
         maze_rows_f = maze_rows.to(dtype=torch.float32)
         maze_cols_f = maze_cols.to(dtype=torch.float32)
 
@@ -577,11 +627,11 @@ class Go2NavEnv(DirectRLEnv):
             goal_local_y = torch.zeros_like(y_extent)
         else:
             # Sample a uniformly random in-bounds point within the maze's footprint.
-            # Bounds are [tile_center - extent/2, tile_center + extent/2] per axis.
-            x_min = - 0.5 * x_extent
-            x_max = + 0.5 * x_extent
-            y_min = - 0.5 * y_extent
-            y_max = + 0.5 * y_extent
+            x_min = -0.5 * x_extent
+            x_min = torch.where(maze_rows_f % 2 == 1, -0.5 * x_extent, -0.5 * x_extent - cell_size)
+            x_max = 0.5 * x_extent
+            y_min = -0.5 * y_extent
+            y_max = torch.where(maze_cols_f % 2 == 1, 0.5 * y_extent, 0.5 * y_extent + cell_size)
 
             u_x = torch.rand(len(env_ids), device=self.device)
             u_y = torch.rand(len(env_ids), device=self.device)
@@ -622,13 +672,12 @@ class Go2NavEnv(DirectRLEnv):
         terrain_generator = self.cfg.terrain.terrain_generator
         maze_cfg = terrain_generator.sub_terrains["maze"]
         cell_size = float(maze_cfg.cell_size)
-
-        max_rows = max(1, int(round(maze_cfg.maze_max_rows)))
+        
+        
         max_cols = max(1, int(round(maze_cfg.maze_max_cols)))
-
         # Per-env curriculum level (0-indexed). Levels 0 & 1 -> 1 row; level k (k>=2) -> k rows.
-        levels = self._terrain.terrain_levels[env_ids].to(dtype=torch.long)
-        maze_rows = torch.clamp(levels, min=1, max=max_rows)
+        terrain_coords = env_ids_to_terrain_coords(env_ids, self._terrain)
+        maze_rows = self.maze_registery.get_num_rows(terrain_coords)
         maze_cols = torch.full_like(maze_rows, max_cols)
 
         maze_rows_f = maze_rows.to(dtype=torch.float32)
@@ -646,10 +695,12 @@ class Go2NavEnv(DirectRLEnv):
         else:
             # Sample a uniformly random in-bounds point within the maze's footprint.
             # Bounds are [tile_center - extent/2, tile_center + extent/2] per axis.
-            x_min = - 0.5 * x_extent
-            x_max = + 0.5 * x_extent
-            y_min = - 0.5 * y_extent
-            y_max = + 0.5 * y_extent
+            # Sample a uniformly random in-bounds point within the maze's footprint.
+            x_min = -0.5 * x_extent
+            x_min = torch.where(maze_rows_f % 2 == 1, -0.5 * x_extent, -0.5 * x_extent - cell_size)
+            x_max = 0.5 * x_extent
+            y_min = -0.5 * y_extent
+            y_max = torch.where(maze_cols_f % 2 == 1, 0.5 * y_extent, 0.5 * y_extent + cell_size)
 
             u_x = torch.rand(len(env_ids), device=self.device)
             u_y = torch.rand(len(env_ids), device=self.device)

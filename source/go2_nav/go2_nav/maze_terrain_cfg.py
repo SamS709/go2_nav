@@ -12,6 +12,7 @@ import random
 from typing import Literal
 
 import numpy as np
+import torch
 import trimesh
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg, FlatPatchSamplingCfg
@@ -21,27 +22,90 @@ from labyrinth.generate import DepthFirstSearchGenerator, KruskalsGenerator, Pri
 from labyrinth.grid import Direction
 from labyrinth.maze import Maze
 
+NUM_TERRAIN_TYPES = 5
 
 class _MazeRegistry:
     """Side-channel storing maze layouts keyed by (terrain_generator_id, row, col)."""
     def __init__(self):
-        self._mazes: list[np.ndarray] = [] 
+        self._mazes: list[torch.Tensor] = [] 
+        self._num_rows: list[int] = []
         self._terrain_num_cols: int
         self._terrain_num_rows: int
+        self._maze_max_cols: int
+        self._maze_max_rows: int
+        self.num_terrain_types = NUM_TERRAIN_TYPES
         
-    def set_dims(self, terrain_rows, terrain_cols):
+    def set_dims(self, terrain_rows: int, terrain_cols: int, maze_max_rows: int, maze_max_cols: int, device):
         self._terrain_num_rows, self._terrain_num_cols = terrain_rows, terrain_cols
+        self._maze_max_rows, self._maze_max_cols = maze_max_rows, maze_max_cols
+        self.device = device
+        self._build_mazes_tensor()
         
+    def get_mazes_terrain_coords(self, terrain_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            terrain_coords: Tensor of shape (num_envs, 2) containing [row, col] for each env.
+        Returns:
+            Tensor of shape (num_envs, max_maze_rows, max_maze_cols) containing the maze layouts.
+        """
+        # Extract rows and cols separately
+        # terrain_coords[:, 0] gives all rows, terrain_coords[:, 1] gives all cols
+        rows = terrain_coords[:, 0].long()
+        cols = terrain_coords[:, 1].long()
+        
+        num_envs = terrain_coords.shape[0]
+        
+        # Initialize output tensor
+        mazes_ordered = torch.zeros(
+            [num_envs, self._maze_max_rows, self._maze_max_cols, 5], 
+            device=self._mazes_tensor.device,
+            dtype=self._mazes_tensor.dtype
+        )
+        
+        # Use advanced indexing: [rows, cols] fetches the specific (row, col) entry for each env
+        # This works because 'rows' and 'cols' are both 1D tensors of length num_envs.
+        # The result shape is automatically (num_envs, max_maze_rows, max_maze_cols)
+        mazes_ordered = self._mazes_tensor[rows, cols]
+        
+        return mazes_ordered
+        
+    def _build_mazes_tensor(self):
+        self._mazes_tensor = -torch.ones([self._terrain_num_rows, self._terrain_num_cols, self._maze_max_rows, self._maze_max_cols, 5])
+        for i in range(self._terrain_num_rows):
+            for j in range(self._terrain_num_cols):
+                assert self._mazes_tensor[i,j].shape == self.maze_at(i,j).shape
+                self._mazes_tensor[i,j] = self.maze_at(i,j)
+        self._mazes_tensor = self._mazes_tensor.to(self.device)
+            
 
-    def record(self, maze_array: np.ndarray):
-        self._mazes.append(maze_array)
+    def record(self, maze_tensor: torch.Tensor, num_row: int):
+        self._mazes.append(maze_tensor)
+        self._num_rows.append(num_row)
         
-    def maze_at(self, row: int, col: int) -> np.ndarray:
+    def maze_at(self, row: int, col: int) -> torch.Tensor:
         """Reassemble into (num_rows, num_cols, ...) using TerrainGenerator's known call order."""
         # TerrainGenerator iterates row-major (sub_terrains call order); see step (c) for the
         # exact assumption here and why it's safe.
         # 0,1 = 1 // 1, 1 = 4 (car terrain num_cols = 3)
-        return self._mazes[row * self._terrain_num_cols + col]
+        # 5 => 2, 1 = 1 * 3 + 2 OK 
+        return self._mazes[col * self._terrain_num_rows + row]
+    
+    def get_num_rows(self, terrain_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            terrain_coords: Tensor of shape (num_envs, 2) containing [row, col] for each env.
+        Returns:
+            Tensor of shape (num_envs,) containing the actual maze row count for each env.
+        """
+        rows = terrain_coords[:, 0].long()
+        cols = terrain_coords[:, 1].long()
+
+        # Same flat indexing as maze_at
+        flat_indices = cols * self._terrain_num_rows + rows  # (num_envs,)
+
+        num_rows_tensor = torch.tensor(self._num_rows, device=self.device, dtype=torch.long)
+        return num_rows_tensor[flat_indices]  # (num_envs,)
+        
     
     def as_list(self) -> list:
         return self._mazes
@@ -432,12 +496,12 @@ def maze_terrain(
     #   - 1 -> stairs
     #   - 2 -> boxes
     #   - 3 -> grid
-    #   - 1 -> stairs
+    #   - 4 -> stairs
     # maze_array[row, col, 1] -> North wall in [0,1] 1 if exixts else 0
     # maze_array[row, col, 2] -> North wall in [0,1] 1 if exixts else 0
     # maze_array[row, col, 3] -> North wall in [0,1] 1 if exixts else 0
     # maze_array[row, col, 4] -> North wall in [0,1] 1 if exixts else 0
-    maze_array = np.zeros((maze_rows, maze_cols, 5))
+    maze_array = torch.zeros((int(cfg.maze_max_rows), int(cfg.maze_max_cols), 5))
     
     
 
@@ -657,8 +721,9 @@ def maze_terrain(
         mesh.vertices = _rotate90_xy(mesh.vertices)
 
     origin = _rotate90_xy(origin)
-    
-    MAZE_REGISTRY.record(maze_array)
+    #flip the rows, so that the maze is oriented correctly when looking at the sim for x and rows increasing
+    MAZE_REGISTRY.record(maze_array.flip(0), maze_rows)
+    print(maze_rows)
 
     return meshes, origin
 
