@@ -164,6 +164,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     NUM_COLS = 1
     MAX_MAZE_ROWS = 8
     MAX_MAZE_COLS = 4
+    cell_size = 2.0
     # y <=> cols & x <=> rows
     # debug: flat ground plane terrain
     # terrain = TerrainImporterCfg(
@@ -184,7 +185,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         terrain_type="generator",
         max_init_terrain_level=1,
         terrain_generator=make_maze_terrain_cfg(
-            cell_size=2.0,
+            cell_size=cell_size,
             maze_max_cols=MAX_MAZE_COLS,
             maze_max_rows=MAX_MAZE_ROWS,
             terrain_num_rows=NUM_ROWS,
@@ -302,16 +303,17 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     rew_scale_goal_progress = 7.0
     rew_scale_goal_orientation = 2.0
     rew_scale_time_penalty = -0.05
-    rew_scale_goal_bonus = 20.0
+    rew_scale_goal_bonus = 200.0
     rew_scale_odom_prediction = 0.4
-    rew_scale_cmd_smoothness = -0.02
-    rew_scale_cmd_magnitude = -0.001
+    rew_scale_cmd_bounds = -0.02
+    rew_scale_cmd_rate = -0.001
     rew_scale_upright = 0.5
     rew_scale_terminated = -5.0
+    rew_scale_undesired_contacts = -10.0
 
     goal_distance_sigma = 2.0
     goal_orientation_sigma = 0.5
-    goal_reached_distance = 0.6
+    goal_reached_distance = cell_size / 3.0
     goal_reached_yaw = 0.5
     odom_prediction_scale = 5.0
 

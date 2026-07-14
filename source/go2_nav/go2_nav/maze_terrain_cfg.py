@@ -491,17 +491,16 @@ def maze_terrain(
     boxes_patch_size = max_cell_span * max(0.1, min(1.0, sampled_boxes_patch_size_ratio))
     rough_patch_size = max_cell_span * max(0.1, min(1.0, sampled_rough_patch_size_ratio))
     
-    # maze_array[row, col, 0] -> terrain_type in [0,1,2,3,4]:
+    # maze_tensor[row, col, 0] -> terrain_type in [0,1,2,3]:
     #   - 0 -> flat
     #   - 1 -> stairs
     #   - 2 -> boxes
     #   - 3 -> grid
-    #   - 4 -> stairs
-    # maze_array[row, col, 1] -> North wall in [0,1] 1 if exixts else 0
-    # maze_array[row, col, 2] -> North wall in [0,1] 1 if exixts else 0
-    # maze_array[row, col, 3] -> North wall in [0,1] 1 if exixts else 0
-    # maze_array[row, col, 4] -> North wall in [0,1] 1 if exixts else 0
-    maze_array = torch.zeros((int(cfg.maze_max_rows), int(cfg.maze_max_cols), 5))
+    # maze_tensor[row, col, 1] -> North wall in [0,1] 1 if exixts else 0
+    # maze_tensor[row, col, 2] -> North wall in [0,1] 1 if exixts else 0
+    # maze_tensor[row, col, 3] -> North wall in [0,1] 1 if exixts else 0
+    # maze_tensor[row, col, 4] -> North wall in [0,1] 1 if exixts else 0
+    maze_tensor = torch.zeros((int(cfg.maze_max_rows), int(cfg.maze_max_cols), 5))
     
     
 
@@ -522,7 +521,7 @@ def maze_terrain(
                         (cx, offset_y + row * cell_h, 0.5 * wall_height),
                     )
                 )
-                maze_array[row, col, 1] = 1
+                maze_tensor[row, col, 1] = 1
                 
             # East boundary
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
@@ -533,7 +532,7 @@ def maze_terrain(
                         (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
                     )
                 )
-                maze_array[row, col, 2] = 1
+                maze_tensor[row, col, 2] = 1
                 
             # South boundary
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
@@ -544,7 +543,7 @@ def maze_terrain(
                         (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
                     )
                 )
-                maze_array[row, col, 3] = 1
+                maze_tensor[row, col, 3] = 1
 
             # West wall
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
@@ -555,7 +554,7 @@ def maze_terrain(
                         (offset_x + col * cell_w, cy, 0.5 * wall_height),
                     )
                 )
-                maze_array[row, col, 4] = 1
+                maze_tensor[row, col, 4] = 1
 
             # ===========================================================================
             # STAIRS 
@@ -603,7 +602,7 @@ def maze_terrain(
                     footprint[0] + 2.0 * hole_margin,
                     footprint[1] + 2.0 * hole_margin,
                 )
-                maze_array[row, col, 0] = 1
+                maze_tensor[row, col, 0] = 1
             # ===========================================================================
             # BOXES
             if (row, col) != spawn_cell and (row, col) not in stairs_cells and rng.random() < boxes_prob:
@@ -617,7 +616,7 @@ def maze_terrain(
                     min_size=cfg.boxes_min_size,
                 )
                 boxes_cells.add((row, col))
-                maze_array[row, col, 0] = 2
+                maze_tensor[row, col, 0] = 2
 
             # GRIDS
             if (
@@ -636,7 +635,7 @@ def maze_terrain(
                     h_rough_z=sampled_rough_h_rough_z,
                     min_size=cfg.rough_min_size,
                 )
-                maze_array[row, col, 0] = 3
+                maze_tensor[row, col, 0] = 3
     # ===========================================================================
     # FLOORS
     # no floor if there is stairs
@@ -722,7 +721,7 @@ def maze_terrain(
 
     origin = _rotate90_xy(origin)
     #flip the rows, so that the maze is oriented correctly when looking at the sim for x and rows increasing
-    MAZE_REGISTRY.record(maze_array.flip(0), maze_rows)
+    MAZE_REGISTRY.record(maze_tensor.flip(0), maze_rows)
     print(maze_rows)
 
     return meshes, origin

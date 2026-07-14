@@ -1,8 +1,16 @@
 To check
-- registering pos freuency
+
+- ensure the result from _get_goal_pos_xy_s is ok
+
+
 
 Checked:
 
 - rows <=> x & cols <=> y
 - mazes in MAZE_REGISTER are oriented registered to correspond to the displayed maze in the sim for x (or rows) increasing.
-- 
+- registering pos frequency
+- _get_goal_pos_s OK: BE CAREFUL,the goal is in the start_pos frame,which frame x points forward and y points left: if the goal is at the left of the start pos, its y coordinate will be negative
+- _get_goal_yaw_s OK: BE CAREFUL, the orientation of the goal is in [-pi,pi] in the start frame    ^^^^^^^^^^^^^
+                                                                                                    ||       ||
+                                                                                                    ||       ||
+                                                                                             -pi<---||FORWARD||-->pi
