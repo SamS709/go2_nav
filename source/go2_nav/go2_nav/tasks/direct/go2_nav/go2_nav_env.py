@@ -47,7 +47,6 @@ class Go2NavEnv(DirectRLEnv):
         
         self._undesired_contact_body_ids_sensor = self._thigh_ids_sensor + self._hip_ids_sensor + self._base_id_sensor
         self._body_contact_info_teacher_sensor = self._base_id_sensor + self._thigh_ids_sensor + self._calf_ids_sensor
-        self._finite_warn_counter = 0
 
         # init output tensors
         # [x, y, z, vx, vy, vz, wx, wy, wz, vxd, vyd, vzd]
@@ -124,7 +123,6 @@ class Go2NavEnv(DirectRLEnv):
         return policy
         
     def _init_goals_and_starts(self):
-        all_env_ids: torch.Tensor = torch.arange(self.num_envs, device=self.device)
         #goals
         self.goal_pos_w: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
         self.goal_yaw_w: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
@@ -132,12 +130,12 @@ class Go2NavEnv(DirectRLEnv):
         self.prev_goal_distance: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
         self.goal_reached: torch.Tensor = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.num_goal_maze_marker: int = self.maze_registery.num_terrain_types        
-        self._update_goals(all_env_ids, center=False)
+        self._update_goals(self.all_env_ids, center=False)
         # starts
         self.start_pos_w: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
         self.start_yaw_w: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
         self.start_quat_w: torch.Tensor = torch.zeros(self.num_envs, 4, device=self.device)
-        self._update_starts(all_env_ids, center=False)
+        self._update_starts(self.all_env_ids, center=False)
         
         
     def _setup_scene(self):
@@ -280,7 +278,7 @@ class Go2NavEnv(DirectRLEnv):
         joint_vel = self._robot.data.joint_vel
         
         # height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize)
-        height_data = self._compute_height_data_from_cloud(randomize=True)
+        height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=True)
         height_data = height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).unsqueeze(1)
         # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
         # cell_size_m = float(self.cfg.loc_cell_size)
@@ -291,9 +289,9 @@ class Go2NavEnv(DirectRLEnv):
         
         # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))            
             
-        # mock_cmd = torch.tensor([0.75, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype).repeat(
-        #     self.num_envs, 1
-        # )
+        mock_cmd = torch.tensor([0.0, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype).repeat(
+            self.num_envs, 1
+        )
 
         proprio_loc = torch.cat( 
             [
@@ -301,8 +299,8 @@ class Go2NavEnv(DirectRLEnv):
                 + (2.0 * torch.rand_like(base_ang_vel) - 1.0) * float(0.1) * self.cfg.randomize,
                 projected_gravity
                 + (2.0 * torch.rand_like(projected_gravity) - 1.0) * float(0.05) * self.cfg.randomize,
-                # mock_cmd,
-                self.cmd_vel,
+                mock_cmd,
+                # self.cmd_vel,
                 joint_pos_rel
                 + (2.0 * torch.rand_like(joint_pos_rel) - 1.0) * float(0.01) * self.cfg.randomize,
                 joint_vel + (2.0 * torch.rand_like(joint_vel) - 1.0) * float(0.1) * self.cfg.randomize,
@@ -323,6 +321,10 @@ class Go2NavEnv(DirectRLEnv):
         height_data_student = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=False)
         height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         height_data_student = height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
+        torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
+        print(height_data_teacher[self.vis_envs].shape)
+
+        
         goal_xy_s = self._get_goal_pos_s()
         goal_yaw_s = self._get_goal_yaw_s()
         pred_pos_hist_mid_term = self.pred_pos_hist_mid_term.reshape(self.num_envs, -1)

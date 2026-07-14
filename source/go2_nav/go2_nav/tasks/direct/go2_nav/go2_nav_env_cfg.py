@@ -106,8 +106,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Planner output: [x, y, z, vx, vy, vz, wx, wy, wz, cmd_x, cmd_y, cmd_z]
     action_space = 12
     nav_cell_size = 0.2
-    nav_x_range = (-0.5, 10.0)
-    nav_y_range = (-10.0, 10.0)
+    nav_x_range = (-0.4, 7.0) # 37
+    nav_y_range = (-7.0, 7.0) # 70
     
     loc_cell_size = 0.1
     loc_x_range = [-0.5, 0.8]
@@ -247,7 +247,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         pattern_cfg=patterns.LidarPatternCfg(
             channels=64, vertical_fov_range=[0.0, 90.0], horizontal_fov_range=[-180, 180], horizontal_res=2.0
         ),
-        max_distance=2.0,
+        max_distance=13.0,
         debug_vis=False,
     )
 
