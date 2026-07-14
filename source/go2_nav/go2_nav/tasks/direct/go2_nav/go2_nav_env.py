@@ -17,6 +17,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 from isaaclab.markers import VisualizationMarkers
+from isaaclab.utils.buffers import DelayBuffer
 from isaaclab.terrains import TerrainImporterCfg ,TerrainImporter
 
 
@@ -80,6 +81,18 @@ class Go2NavEnv(DirectRLEnv):
         self.prev_loc_actions: torch.Tensor = torch.zeros_like(self.loc_actions)
         self.low_level_joint_targets = self._robot.data.default_joint_pos.clone()
 
+        if self.cfg.delay == True:
+            self._proprio_delay_buffer: DelayBuffer = DelayBuffer(history_length=self.cfg.delay_length, batch_size=self.num_envs, device=self.device)
+            if self.cfg.delay_length > 0:
+                self._proprio_delay_buffer.set_time_lag(
+                    torch.randint(low=0, high=self.cfg.history_length, size=(self.num_envs,), device=self.device)
+                )
+            self._grid_delay_buffer: DelayBuffer = DelayBuffer(history_length=self.cfg.delay_length, batch_size=self.num_envs, device=self.device)
+            if self.cfg.delay_length > 0:
+                self._grid_delay_buffer.set_time_lag(
+                    torch.randint(low=0, high=self.cfg.delay_length, size=(self.num_envs,), device=self.device)
+                )
+        
         self._init_goals_and_starts()
         
 
@@ -322,7 +335,7 @@ class Go2NavEnv(DirectRLEnv):
         height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         height_data_student = height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        print(height_data_teacher[self.vis_envs].shape)
+        print(height_data_teacher[self.vis_envs][0,0:20,30:40])
 
         
         goal_xy_s = self._get_goal_pos_s()
@@ -353,7 +366,11 @@ class Go2NavEnv(DirectRLEnv):
         teacher_proprio = self._sanitize_tensor(teacher_proprio, "teacher_proprio", clamp_abs=100.0)
         student_height_scan = self._sanitize_tensor(height_data_teacher, "student_height_scan", clamp_abs=10.0)
         teacher_height_scan = self._sanitize_tensor(height_data_student, "teacher_height_scan", clamp_abs=10.0)
-
+        if self.cfg.delay:
+            teacher_proprio = self._proprio_delay_buffer.compute(teacher_proprio)
+            teacher_height_scan = self._grid_delay_buffer.compute(teacher_height_scan)
+            student_proprio = self._proprio_delay_buffer.compute(student_proprio)
+            student_height_scan = self._grid_delay_buffer.compute(student_height_scan)
         return {
             "student_proprio": student_proprio,
             "student_height_scan": student_height_scan,
@@ -495,6 +512,16 @@ class Go2NavEnv(DirectRLEnv):
 
         self._update_goals(env_ids_tensor, False)
         self._update_starts(env_ids_tensor, False)
+        
+        if self.cfg.delay == True:
+            self._proprio_delay_buffer.reset(env_ids_tensor.tolist())
+            self._proprio_delay_buffer.set_time_lag(
+                    torch.randint(low=0, high=self.cfg.delay_length, size=(self.num_envs,), device=self.device)
+                )
+            self._grid_delay_buffer.reset(env_ids_tensor.tolist())
+            self._grid_delay_buffer.set_time_lag(
+                    torch.randint(low=0, high=self.cfg.delay_length, size=(self.num_envs,), device=self.device)
+                )
         
         root_state = torch.cat([self.start_pos_w[env_ids], self.start_quat_w[env_ids]], dim=-1)
         

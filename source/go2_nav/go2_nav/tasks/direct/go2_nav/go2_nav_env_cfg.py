@@ -102,7 +102,11 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     sim_freq = 200
     policy_freq = sim_freq / 4
     sim_dt = 1 / sim_freq
-    episode_length_s = 30.0
+    episode_length_s = 120.0
+    
+    delay: bool = False
+    delay_length: int = 4
+    
     # Planner output: [x, y, z, vx, vy, vz, wx, wy, wz, cmd_x, cmd_y, cmd_z]
     action_space = 12
     nav_cell_size = 0.2
@@ -247,8 +251,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         pattern_cfg=patterns.LidarPatternCfg(
             channels=64, vertical_fov_range=[0.0, 90.0], horizontal_fov_range=[-180, 180], horizontal_res=2.0
         ),
-        max_distance=13.0,
-        debug_vis=False,
+        max_distance=10.0,
+        debug_vis=True,
     )
 
     # scene
