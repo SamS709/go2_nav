@@ -16,4 +16,6 @@ Checked:
                                                                                              -pi<---||FORWARD||-->pi
 - BOXES generation 
 - DOORS generation
-- WALLs destruction
+- WALLS destruction
+- STAIRS generation
+- GRID GENERATION

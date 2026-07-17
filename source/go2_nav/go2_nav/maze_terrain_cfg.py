@@ -491,32 +491,30 @@ def maze_terrain(
     wall_height = _sample_float(rng, cfg.wall_height, cfg.wall_height_range)
     wall_thickness = _sample_float(rng, cfg.wall_thickness, cfg.wall_thickness_range)
     
-    sampled_stairs_prob_per_m2 = _sample_float(
-        rng, cfg.stairs_prob_per_m2, cfg.stairs_prob_per_m2_range, min_value=0.0
+    sampled_stairs_prob = _sample_float(
+        rng, 0.1, cfg.stairs_prob_range, min_value=0.0
     )
-    sampled_boxes_prob_per_m2 = _sample_float(
-        rng, cfg.boxes_prob_per_m2, cfg.boxes_prob_per_m2_range, min_value=0.0
+    sampled_boxes_prob = _sample_float(
+        rng, 0.1, cfg.boxes_prob_range, min_value=0.0
     )
-    sampled_rough_prob_per_m2 = _sample_float(
-        rng, cfg.rough_prob_per_m2, cfg.rough_prob_per_m2_range, min_value=0.0
+    sampled_rough_prob = _sample_float(
+        rng, 0.1, cfg.rough_prob_range, min_value=0.0
     )
 
     sampled_boxes_patch_size_ratio = _sample_float(
-        rng, cfg.boxes_patch_size_ratio, cfg.boxes_patch_size_ratio_range, min_value=0.0
+        rng, cfg.cell_size, cfg.boxes_patch_size_ratio_range, min_value=0.0
+    )
+    
+    sampled_rough_patch_size_ratio = _sample_float(
+        rng, cfg.cell_size, cfg.rough_patch_size_ratio_range, min_value=0.0
     )
 
-    sampled_rough_n_rough = _sample_int(rng, cfg.rough_n_rough, cfg.rough_n_rough_range, min_value=0)
-    sampled_rough_h_rough_xy = _sample_float(rng, cfg.rough_h_rough_xy, cfg.rough_h_rough_xy_range)
-    sampled_rough_h_rough_z = _sample_float(rng, cfg.rough_h_rough_z, cfg.rough_h_rough_z_range)
-    sampled_rough_patch_size_ratio = _sample_float(
-        rng, cfg.rough_patch_size_ratio, cfg.rough_patch_size_ratio_range, min_value=0.0
-    )
 
     # Per-cell probabilities from density definitions.
     cell_area = cell_w * cell_h
-    stairs_prob = _clamp01(sampled_stairs_prob_per_m2 * cell_area)
-    boxes_prob = _clamp01(sampled_boxes_prob_per_m2 * cell_area)
-    rough_prob = _clamp01(sampled_rough_prob_per_m2 * cell_area)
+    stairs_prob = _clamp01(sampled_stairs_prob)
+    boxes_prob = _clamp01(sampled_boxes_prob)
+    rough_prob = _clamp01(sampled_rough_prob)
 
     # Reserve a guaranteed spawn cell so origin is always at a cell center and unobstructed.
     spawn_cell = (maze_rows // 2, maze_cols // 2)
@@ -527,7 +525,6 @@ def maze_terrain(
     stairs_footprints: dict[tuple[int, int], tuple[Direction, float, float]] = {}
 
     max_cell_span = min(cell_w, cell_h)
-    rough_patch_size = max_cell_span * max(0.1, min(1.0, sampled_rough_patch_size_ratio))
     
     # maze_tensor[row, col, 0] -> terrain_type in [0,1,2,3]:
     #   - 0 -> flat
@@ -720,15 +717,14 @@ def maze_terrain(
                 and rng.random() < rough_prob
             ):
                 rough_patch_size = max_cell_span * max(0.1, min(1.0, sampled_rough_patch_size_ratio))
-                _append_rough_meshes(
+                _append_boxes_meshes(
                     meshes=meshes,
                     rng=rng,
                     center=(cx, cy, 0.0),
                     patch_size=rough_patch_size,
-                    n_rough=sampled_rough_n_rough,
-                    h_rough_xy=sampled_rough_h_rough_xy,
-                    h_rough_z=sampled_rough_h_rough_z,
-                    min_size=cfg.rough_min_size,
+                    n_boxes_range=cfg.rough_n_rough_range,
+                    h_boxes_range=cfg.rough_h_rough_z_range,
+                    l_boxes_range=cfg.rough_h_rough_xy_range,
                 )
                 maze_tensor[row, col, 0] = 3
     # ===========================================================================
@@ -844,8 +840,7 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
     door_width_range: list = [0.5, 1.0]
 
     # Stairs parameters.
-    stairs_prob_per_m2: float = 0.15
-    stairs_prob_per_m2_range: tuple[float, float] | None = None
+    stairs_prob_range: tuple[float, float] | None = None
     stairs_step_height: float = 0.05
     stairs_step_height_range: tuple[float, float] | None = None
     stairs_step_depth: float = 0.18
@@ -859,27 +854,18 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
     stairs_hole_margin: float = 0.002
 
     # Boxes parameters.
-    boxes_prob_per_m2: float = 0.12
-    boxes_prob_per_m2_range: tuple[float, float] | None = None
+    boxes_prob_range: tuple[float, float] = (0.1, 0.15)
     boxes_n_boxes_range: tuple[int, int] = (2, 3)
     boxes_h_boxes_range: tuple[float, float] = (0.3, 2.0)
     boxes_l_boxes_range: tuple[float, float] = (0.2, 0.5)
-    boxes_patch_size_ratio: float = 0.9
     boxes_patch_size_ratio_range: tuple[float, float] | None = None
-    boxes_min_size: float = 0.01
 
     # Roughness parameters.
-    rough_prob_per_m2: float = 0.10
-    rough_prob_per_m2_range: tuple[float, float] | None = None
-    rough_n_rough: int = 32
-    rough_n_rough_range: tuple[int, int] | None = None
-    rough_h_rough_xy: float = 0.15
-    rough_h_rough_xy_range: tuple[float, float] | None = None
-    rough_h_rough_z: float = 0.01
-    rough_h_rough_z_range: tuple[float, float] | None = None
-    rough_patch_size_ratio: float = 0.9
-    rough_patch_size_ratio_range: tuple[float, float] | None = None
-    rough_min_size: float = 0.008
+    rough_prob_range: tuple[float, float] = (0.1, 0.15)
+    rough_n_rough_range: tuple[int, int] = (5, 30)
+    rough_h_rough_xy_range: tuple[float, float] = (0.2, 2.0)
+    rough_h_rough_z_range: tuple[float, float] = (0.05, 0.3)
+    rough_patch_size_ratio_range: tuple[float, float] = (1.0, 2.0)
 
     algorithm: Literal["dfs", "kruskal", "prims", "wilson"] = "dfs"
     seed: int | None = 0
@@ -918,9 +904,9 @@ def make_maze_terrain_cfg(
     door_width_range: list = [0.5, 1.0],
     algorithm: Literal["dfs", "kruskal", "prims", "wilson"] = "dfs",
     seed: int | None = 0,
-    stairs_prob_per_m2_range: tuple[float, float] = (0.15, 0.15),
-    boxes_prob_per_m2_range: tuple[float, float] = (0.12, 0.12),
-    rough_prob_per_m2_range: tuple[float, float] = (0.10, 0.10),
+    stairs_prob_range: tuple[float, float] = (0.15, 0.15),
+    boxes_prob_range: tuple[float, float] = (0.12, 0.12),
+    rough_prob_range: tuple[float, float] = (0.10, 0.10),
     stairs_step_height_range: tuple[float, float] = (0.05, 0.05),
     stairs_step_depth_range: tuple[float, float] = (0.18, 0.18),
     stairs_step_width: float = 0.0,
@@ -932,7 +918,6 @@ def make_maze_terrain_cfg(
     boxes_h_boxes_range: tuple[float, float] = (0.18, 0.18),
     boxes_l_boxes_range: tuple[float, float] = (0.3, 0.5),
     boxes_patch_size_ratio_range: tuple[float, float] = (0.9, 0.9),
-    boxes_min_size: float = 0.2,
     rough_n_rough_range: tuple[int, int] = (32, 32),
     rough_h_rough_xy_range: tuple[float, float] = (0.15, 0.15),
     rough_h_rough_z_range: tuple[float, float] = (0.01, 0.01),
@@ -966,12 +951,12 @@ def make_maze_terrain_cfg(
     door_width_range_low = max(0.0, min(float(door_width_range[0]), float(door_width_range[1])))
     door_width_range_high = max(door_width_range_low, max(float(door_width_range[0]), float(door_width_range[1])))
     
-    stairs_prob_low = max(0.0, min(float(stairs_prob_per_m2_range[0]), float(stairs_prob_per_m2_range[1])))
-    stairs_prob_high = max(stairs_prob_low, max(float(stairs_prob_per_m2_range[0]), float(stairs_prob_per_m2_range[1])))
-    boxes_prob_low = max(0.0, min(float(boxes_prob_per_m2_range[0]), float(boxes_prob_per_m2_range[1])))
-    boxes_prob_high = max(boxes_prob_low, max(float(boxes_prob_per_m2_range[0]), float(boxes_prob_per_m2_range[1])))
-    rough_prob_low = max(0.0, min(float(rough_prob_per_m2_range[0]), float(rough_prob_per_m2_range[1])))
-    rough_prob_high = max(rough_prob_low, max(float(rough_prob_per_m2_range[0]), float(rough_prob_per_m2_range[1])))
+    stairs_prob_low = max(0.0, min(float(stairs_prob_range[0]), float(stairs_prob_range[1])))
+    stairs_prob_high = max(stairs_prob_low, max(float(stairs_prob_range[0]), float(stairs_prob_range[1])))
+    boxes_prob_low = max(0.0, min(float(boxes_prob_range[0]), float(boxes_prob_range[1])))
+    boxes_prob_high = max(boxes_prob_low, max(float(boxes_prob_range[0]), float(boxes_prob_range[1])))
+    rough_prob_low = max(0.0, min(float(rough_prob_range[0]), float(rough_prob_range[1])))
+    rough_prob_high = max(rough_prob_low, max(float(rough_prob_range[0]), float(rough_prob_range[1])))
 
     stairs_step_height_low = max(1e-4, min(float(stairs_step_height_range[0]), float(stairs_step_height_range[1])))
     stairs_step_height_high = max(
@@ -1028,12 +1013,9 @@ def make_maze_terrain_cfg(
         min_door_height=min_door_height,
         algorithm=algorithm,
         seed=seed,
-        stairs_prob_per_m2=stairs_prob_low,
-        stairs_prob_per_m2_range=(stairs_prob_low, stairs_prob_high),
-        boxes_prob_per_m2=boxes_prob_low,
-        boxes_prob_per_m2_range=(boxes_prob_low, boxes_prob_high),
-        rough_prob_per_m2=rough_prob_low,
-        rough_prob_per_m2_range=(rough_prob_low, rough_prob_high),
+        stairs_prob_range=(stairs_prob_low, stairs_prob_high),
+        boxes_prob_range=(boxes_prob_low, boxes_prob_high),
+        rough_prob_range=(rough_prob_low, rough_prob_high),
         stairs_step_height=stairs_step_height_low,
         stairs_step_height_range=(stairs_step_height_low, stairs_step_height_high),
         stairs_step_depth=stairs_step_depth_low,
@@ -1047,16 +1029,10 @@ def make_maze_terrain_cfg(
         boxes_n_boxes_range=(boxes_n_low, boxes_n_high),
         boxes_h_boxes_range=(boxes_h_low, boxes_h_high),
         boxes_l_boxes_range=(boxes_l_low, boxes_l_high),
-        boxes_patch_size_ratio=boxes_patch_low,
         boxes_patch_size_ratio_range=(boxes_patch_low, boxes_patch_high),
-        boxes_min_size=boxes_min_size,
-        rough_n_rough=rough_n_low,
         rough_n_rough_range=(rough_n_low, rough_n_high),
-        rough_h_rough_xy=rough_xy_low,
         rough_h_rough_xy_range=(rough_xy_low, rough_xy_high),
-        rough_h_rough_z=rough_z_low,
         rough_h_rough_z_range=(rough_z_low, rough_z_high),
-        rough_patch_size_ratio=rough_patch_low,
         rough_patch_size_ratio_range=(rough_patch_low, rough_patch_high),
     )
 
