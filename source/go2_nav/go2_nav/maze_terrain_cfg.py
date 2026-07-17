@@ -193,6 +193,48 @@ def _box_mesh(
         transform = trimesh.transformations.concatenate_matrices(transform, rot)
     return trimesh.creation.box(extents=size, transform=transform)
 
+def _box_mesh_with_door(
+    size: tuple[float, float, float],
+    position: tuple[float, float, float],
+    door_width: float = 0.3,
+    door_height: float = 0.4,
+) -> trimesh.Trimesh:
+    bx, by, bz = size
+    px, py, pz = position
+
+    # Split along the largest horizontal dimension
+    if bx >= by:
+        # Door hole along X axis — left/right pieces split on X
+        long = bx
+        door_width = min(door_width, long - 1e-1)
+        door_height = min(door_height, bz - 1e-1)
+        side_width = (long - door_width) / 2.0
+        top_height = bz - door_height
+
+        pieces = []
+        if side_width > 1e-6:
+            pieces.append(_box_mesh((side_width, by, bz), (px - 0.5 * (door_width + side_width), py, pz)))
+            pieces.append(_box_mesh((side_width, by, bz), (px + 0.5 * (door_width + side_width), py, pz)))
+        if top_height > 1e-6:
+            pieces.append(_box_mesh((door_width, by, top_height), (px, py, pz + 0.5 * (bz - top_height))))
+    else:
+        # Door hole along Y axis — left/right pieces split on Y
+        long = by
+        door_width = min(door_width, long - 1e-1)
+        door_height = min(door_height, bz - 1e-1)
+        side_width = (long - door_width) / 2.0
+        top_height = bz - door_height
+
+        pieces = []
+        if side_width > 1e-6:
+            pieces.append(_box_mesh((bx, side_width, bz), (px, py - 0.5 * (door_width + side_width), pz)))
+            pieces.append(_box_mesh((bx, side_width, bz), (px, py + 0.5 * (door_width + side_width), pz)))
+        if top_height > 1e-6:
+            pieces.append(_box_mesh((bx, door_width, top_height), (px, py, pz + 0.5 * (bz - top_height))))
+
+    return trimesh.util.concatenate(pieces)
+    
+
 
 def _append_stairs_meshes(
     meshes: list[trimesh.Trimesh],
@@ -281,22 +323,19 @@ def _append_boxes_meshes(
     rng: random.Random,
     center: tuple[float, float, float],
     patch_size: float,
-    n_boxes: int,
-    h_boxes: float,
-    min_size: float,
+    n_boxes_range: tuple[int, int],
+    h_boxes_range: tuple[float, float],
+    l_boxes_range: tuple[float, float],
 ) -> None:
     """Append random box obstacles inside a square patch."""
-    if n_boxes <= 0:
-        return
-    n_spawn = rng.randint(0, n_boxes)
+
+    n_spawn = rng.randint(n_boxes_range[0], n_boxes_range[1])
     half_patch = 0.5 * patch_size
-    min_size = max(1e-4, min_size)
 
     for _ in range(n_spawn):
-        lx = max(min_size, rng.uniform(0.0, h_boxes))
-        ly = max(min_size, rng.uniform(0.0, h_boxes))
-        lz = max(min_size, rng.uniform(0.0, h_boxes))
-
+        lx = rng.uniform(l_boxes_range[0], l_boxes_range[1])
+        ly = rng.uniform(l_boxes_range[0], l_boxes_range[1])
+        lz = rng.uniform(h_boxes_range[0], h_boxes_range[1])
         x_margin = max(0.0, half_patch - 0.5 * lx)
         y_margin = max(0.0, half_patch - 0.5 * ly)
         x = center[0] + rng.uniform(-x_margin, x_margin)
@@ -424,6 +463,8 @@ def maze_terrain(
 
     # Sample wall destroy
     p_wall_dest = cfg.p_wall_dest
+    p_wall_door = cfg.p_wall_door
+
      
 
     max_rows = max(1, int(round(cfg.maze_max_rows)))
@@ -449,7 +490,7 @@ def maze_terrain(
     # Sample tile-level parameters from configured ranges.
     wall_height = _sample_float(rng, cfg.wall_height, cfg.wall_height_range)
     wall_thickness = _sample_float(rng, cfg.wall_thickness, cfg.wall_thickness_range)
-
+    
     sampled_stairs_prob_per_m2 = _sample_float(
         rng, cfg.stairs_prob_per_m2, cfg.stairs_prob_per_m2_range, min_value=0.0
     )
@@ -460,8 +501,6 @@ def maze_terrain(
         rng, cfg.rough_prob_per_m2, cfg.rough_prob_per_m2_range, min_value=0.0
     )
 
-    sampled_boxes_n_boxes = _sample_int(rng, cfg.boxes_n_boxes, cfg.boxes_n_boxes_range, min_value=0)
-    sampled_boxes_h_boxes = _sample_float(rng, cfg.boxes_h_boxes, cfg.boxes_h_boxes_range)
     sampled_boxes_patch_size_ratio = _sample_float(
         rng, cfg.boxes_patch_size_ratio, cfg.boxes_patch_size_ratio_range, min_value=0.0
     )
@@ -488,7 +527,6 @@ def maze_terrain(
     stairs_footprints: dict[tuple[int, int], tuple[Direction, float, float]] = {}
 
     max_cell_span = min(cell_w, cell_h)
-    boxes_patch_size = max_cell_span * max(0.1, min(1.0, sampled_boxes_patch_size_ratio))
     rough_patch_size = max_cell_span * max(0.1, min(1.0, sampled_rough_patch_size_ratio))
     
     # maze_tensor[row, col, 0] -> terrain_type in [0,1,2,3]:
@@ -506,6 +544,9 @@ def maze_terrain(
 
     for row in range(maze_rows):
         for col in range(maze_cols):
+            
+            door_height =  _sample_float(rng, cfg.min_door_height, (cfg.min_door_height, wall_height))
+            door_width =  _sample_float(rng, cfg.door_width_range[0], (cfg.door_width_range[0], cfg.door_width_range[1]))
             cell = maze.get_cell(row, col)
             cx = offset_x + (col + 0.5) * cell_w
             cy = offset_y + (row + 0.5) * cell_h
@@ -513,48 +554,100 @@ def maze_terrain(
             # ===========================================================================
             # WALLS 
             # North wall
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 
+            door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and row != 0 
             if Direction.N not in cell.open_walls and not dest_wall_cond:
-                meshes.append(
-                    _box_mesh(
-                        (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + row * cell_h, 0.5 * wall_height),
+                if door_wall_cond:
+                    print("DOOR")
+                    meshes.append(
+                        _box_mesh_with_door(
+                            (cell_w + wall_thickness, wall_thickness, wall_height),
+                            (cx, offset_y + row * cell_h, 0.5 * wall_height),
+                            door_width,
+                            door_height,
+                        )
                     )
-                )
-                maze_tensor[row, col, 1] = 1
+                    maze_tensor[row, col, 1] = 0
+                else:
+                    meshes.append(
+                        _box_mesh(
+                            (cell_w + wall_thickness, wall_thickness, wall_height),
+                            (cx, offset_y + row * cell_h, 0.5 * wall_height),
+                        )
+                    )
+                    maze_tensor[row, col, 1] = 1
                 
             # East boundary
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and col != maze_cols - 1            
+            door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and col != maze_cols - 1            
             if col == maze_cols - 1 and Direction.E not in cell.open_walls and not dest_wall_cond:
-                meshes.append(
-                    _box_mesh(
-                        (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
+                if door_wall_cond:
+                    print("DOOR")
+                    meshes.append(
+                        _box_mesh_with_door(
+                            (wall_thickness, cell_h + wall_thickness, wall_height),
+                            (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
+                            door_width,
+                            door_height,
+                        )
                     )
-                )
-                maze_tensor[row, col, 2] = 1
+                    maze_tensor[row, col, 2] = 0
+                else:
+                    meshes.append(
+                        _box_mesh(
+                            (wall_thickness, cell_h + wall_thickness, wall_height),
+                            (offset_x + (col + 1) * cell_w, cy, 0.5 * wall_height),
+                        )
+                    )
+                    maze_tensor[row, col, 2] = 1
                 
             # South boundary
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1            
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != maze_rows - 1           
+            door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and row != maze_rows - 1           
             if row == maze_rows - 1 and Direction.S not in cell.open_walls and not dest_wall_cond:
-                meshes.append(
-                    _box_mesh(
-                        (cell_w + wall_thickness, wall_thickness, wall_height),
-                        (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
+                if door_wall_cond:
+                    print("DOOR")
+                    meshes.append(
+                        _box_mesh_with_door(
+                            (cell_w + wall_thickness, wall_thickness, wall_height),
+                            (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
+                            door_width,
+                            door_height,
+                        )
                     )
-                )
-                maze_tensor[row, col, 3] = 1
+                    maze_tensor[row, col, 3] = 0
+                else:
+                    meshes.append(
+                        _box_mesh(
+                            (cell_w + wall_thickness, wall_thickness, wall_height),
+                            (cx, offset_y + (row + 1) * cell_h, 0.5 * wall_height),
+                        )
+                    )
+                    maze_tensor[row, col, 3] = 1
 
             # West wall
-            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and row != 0 and row != maze_rows - 1 and col != 0 and col != maze_cols - 1
+            dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and col != 0 
+            door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and col != 0 
             if Direction.W not in cell.open_walls and not dest_wall_cond:
-                meshes.append(
-                    _box_mesh(
-                        (wall_thickness, cell_h + wall_thickness, wall_height),
-                        (offset_x + col * cell_w, cy, 0.5 * wall_height),
+                if door_wall_cond:
+                    print("DOOR")
+                    meshes.append(
+                        _box_mesh_with_door(
+                            (wall_thickness, cell_h + wall_thickness, wall_height),
+                            (offset_x + col * cell_w, cy, 0.5 * wall_height),
+                            door_width,
+                            door_height,
+                        )
                     )
-                )
-                maze_tensor[row, col, 4] = 1
+                    maze_tensor[row, col, 4] = 0
+                else:
+                    meshes.append(
+                        _box_mesh(
+                            (wall_thickness, cell_h + wall_thickness, wall_height),
+                            (offset_x + col * cell_w, cy, 0.5 * wall_height),
+                        )
+                    )
+                    maze_tensor[row, col, 4] = 1
 
             # ===========================================================================
             # STAIRS 
@@ -606,14 +699,15 @@ def maze_terrain(
             # ===========================================================================
             # BOXES
             if (row, col) != spawn_cell and (row, col) not in stairs_cells and rng.random() < boxes_prob:
+                boxes_patch_size = max_cell_span * max(0.1, min(1.0, sampled_boxes_patch_size_ratio))
                 _append_boxes_meshes(
                     meshes=meshes,
                     rng=rng,
                     center=(cx, cy, 0.0),
                     patch_size=boxes_patch_size,
-                    n_boxes=sampled_boxes_n_boxes,
-                    h_boxes=sampled_boxes_h_boxes,
-                    min_size=cfg.boxes_min_size,
+                    n_boxes_range=cfg.boxes_n_boxes_range,
+                    h_boxes_range=cfg.boxes_h_boxes_range,
+                    l_boxes_range=cfg.boxes_l_boxes_range,
                 )
                 boxes_cells.add((row, col))
                 maze_tensor[row, col, 0] = 2
@@ -625,6 +719,7 @@ def maze_terrain(
                 and (row, col) not in boxes_cells
                 and rng.random() < rough_prob
             ):
+                rough_patch_size = max_cell_span * max(0.1, min(1.0, sampled_rough_patch_size_ratio))
                 _append_rough_meshes(
                     meshes=meshes,
                     rng=rng,
@@ -732,7 +827,7 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
 
     function = maze_terrain
 
-    cell_size: float = 0.6
+    cell_size: float = 2.0
     maze_max_cols: float = 10.0
     maze_max_rows: float = 10.0
     maze_cols: float | None = None # shouldn't be specified: useful to retrieve information during training
@@ -743,7 +838,10 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
     wall_thickness: float = 0.05
     wall_thickness_range: tuple[float, float] | None = None
     floor_thickness: float = 0.08
-    p_wall_dest: float = 0.3
+    p_wall_dest: float = 0.2
+    p_wall_door: float = 0.2
+    min_door_height: float = 0.45
+    door_width_range: list = [0.5, 1.0]
 
     # Stairs parameters.
     stairs_prob_per_m2: float = 0.15
@@ -763,10 +861,9 @@ class MeshMazeTerrainCfg(SubTerrainBaseCfg):
     # Boxes parameters.
     boxes_prob_per_m2: float = 0.12
     boxes_prob_per_m2_range: tuple[float, float] | None = None
-    boxes_n_boxes: int = 8
-    boxes_n_boxes_range: tuple[int, int] | None = None
-    boxes_h_boxes: float = 0.18
-    boxes_h_boxes_range: tuple[float, float] | None = None
+    boxes_n_boxes_range: tuple[int, int] = (2, 3)
+    boxes_h_boxes_range: tuple[float, float] = (0.3, 2.0)
+    boxes_l_boxes_range: tuple[float, float] = (0.2, 0.5)
     boxes_patch_size_ratio: float = 0.9
     boxes_patch_size_ratio_range: tuple[float, float] | None = None
     boxes_min_size: float = 0.01
@@ -815,7 +912,10 @@ def make_maze_terrain_cfg(
     wall_height_range: tuple[float, float] = (0.5, 0.5),
     wall_thickness_range: tuple[float, float] = (0.05, 0.05),
     floor_thickness: float = 0.08,
-    p_wall_dest: float = 0.3,
+    p_wall_dest: float = 0.2,
+    p_wall_door: float = 0.2,
+    min_door_height: float = 2.0,
+    door_width_range: list = [0.5, 1.0],
     algorithm: Literal["dfs", "kruskal", "prims", "wilson"] = "dfs",
     seed: int | None = 0,
     stairs_prob_per_m2_range: tuple[float, float] = (0.15, 0.15),
@@ -830,7 +930,9 @@ def make_maze_terrain_cfg(
     stairs_hole_margin: float = 0.002,
     boxes_n_boxes_range: tuple[int, int] = (8, 8),
     boxes_h_boxes_range: tuple[float, float] = (0.18, 0.18),
+    boxes_l_boxes_range: tuple[float, float] = (0.3, 0.5),
     boxes_patch_size_ratio_range: tuple[float, float] = (0.9, 0.9),
+    boxes_min_size: float = 0.2,
     rough_n_rough_range: tuple[int, int] = (32, 32),
     rough_h_rough_xy_range: tuple[float, float] = (0.15, 0.15),
     rough_h_rough_z_range: tuple[float, float] = (0.01, 0.01),
@@ -859,6 +961,10 @@ def make_maze_terrain_cfg(
     )
 
     p_wall_dest = min(1.0, max(0.0, p_wall_dest))
+    p_wall_door = min(1.0, max(0.0, p_wall_door))
+    min_door_height = min(wall_height_high - 1e-4, max(0.0, min_door_height))
+    door_width_range_low = max(0.0, min(float(door_width_range[0]), float(door_width_range[1])))
+    door_width_range_high = max(door_width_range_low, max(float(door_width_range[0]), float(door_width_range[1])))
     
     stairs_prob_low = max(0.0, min(float(stairs_prob_per_m2_range[0]), float(stairs_prob_per_m2_range[1])))
     stairs_prob_high = max(stairs_prob_low, max(float(stairs_prob_per_m2_range[0]), float(stairs_prob_per_m2_range[1])))
@@ -882,6 +988,8 @@ def make_maze_terrain_cfg(
     boxes_n_high = max(boxes_n_low, max(int(boxes_n_boxes_range[0]), int(boxes_n_boxes_range[1])))
     boxes_h_low = max(1e-4, min(float(boxes_h_boxes_range[0]), float(boxes_h_boxes_range[1])))
     boxes_h_high = max(boxes_h_low, max(float(boxes_h_boxes_range[0]), float(boxes_h_boxes_range[1])))
+    boxes_l_low = max(1e-4, min(float(boxes_l_boxes_range[0]), float(boxes_l_boxes_range[1])))
+    boxes_l_high = max(boxes_l_low, max(float(boxes_l_boxes_range[0]), float(boxes_l_boxes_range[1])))
     boxes_patch_low = max(0.0, min(float(boxes_patch_size_ratio_range[0]), float(boxes_patch_size_ratio_range[1])))
     boxes_patch_high = max(
         boxes_patch_low, max(float(boxes_patch_size_ratio_range[0]), float(boxes_patch_size_ratio_range[1]))
@@ -915,6 +1023,9 @@ def make_maze_terrain_cfg(
         wall_thickness_range=(wall_thickness_low, wall_thickness_high),
         floor_thickness=floor_thickness,
         p_wall_dest=p_wall_dest,
+        p_wall_door=p_wall_door,
+        door_width_range=(door_width_range_low, door_width_range_high),
+        min_door_height=min_door_height,
         algorithm=algorithm,
         seed=seed,
         stairs_prob_per_m2=stairs_prob_low,
@@ -933,12 +1044,12 @@ def make_maze_terrain_cfg(
         stairs_landing_depth=stairs_landing_depth,
         stairs_start_down_prob=stairs_start_down_prob,
         stairs_hole_margin=stairs_hole_margin,
-        boxes_n_boxes=boxes_n_low,
         boxes_n_boxes_range=(boxes_n_low, boxes_n_high),
-        boxes_h_boxes=boxes_h_low,
         boxes_h_boxes_range=(boxes_h_low, boxes_h_high),
+        boxes_l_boxes_range=(boxes_l_low, boxes_l_high),
         boxes_patch_size_ratio=boxes_patch_low,
         boxes_patch_size_ratio_range=(boxes_patch_low, boxes_patch_high),
+        boxes_min_size=boxes_min_size,
         rough_n_rough=rough_n_low,
         rough_n_rough_range=(rough_n_low, rough_n_high),
         rough_h_rough_xy=rough_xy_low,

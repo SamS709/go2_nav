@@ -158,6 +158,12 @@ class Go2NavEnv(DirectRLEnv):
 
         self._height_scanner = self.cfg.height_scanner.class_type(self.cfg.height_scanner)
         self.scene.sensors["height_scanner"] = self._height_scanner
+        self._rots_yaw = torch.empty(self.num_envs, device=self.device)
+        self._rots_roll = torch.empty(self.num_envs, device=self.device)
+        self._offsets = torch.empty(self.num_envs, device=self.device)
+        self._rots_yaw.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
+        self._rots_roll.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
+        self._offsets.uniform_(-self.cfg.max_offset, self.cfg.max_offset)
         self._setup_lidar_values()
         self._create_gaussian_heightmap(self.loc_x_cells, self.loc_y_cells)
         
@@ -177,7 +183,7 @@ class Go2NavEnv(DirectRLEnv):
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
         # add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg = sim_utils.DomeLightCfg(intensity=10000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
         
     def _setup_lidar_values(self):
@@ -335,7 +341,7 @@ class Go2NavEnv(DirectRLEnv):
         height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         height_data_student = height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        print(height_data_teacher[self.vis_envs][0,0:20,30:40])
+        print(height_data_teacher[self.vis_envs][0,20:,25:45])
 
         
         goal_xy_s = self._get_goal_pos_s()
@@ -513,6 +519,14 @@ class Go2NavEnv(DirectRLEnv):
         self._update_goals(env_ids_tensor, False)
         self._update_starts(env_ids_tensor, False)
         
+        if hasattr(self, "_rots"):
+            num_resets = env_ids_tensor.numel()
+            self._rots_yaw[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(-self.cfg.max_rot, self.cfg.max_rot)
+            self._rots_roll[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(-self.cfg.max_rot, self.cfg.max_rot)    
+            self._offsets[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(
+                -self.cfg.max_offset, self.cfg.max_offset
+            )
+        
         if self.cfg.delay == True:
             self._proprio_delay_buffer.reset(env_ids_tensor.tolist())
             self._proprio_delay_buffer.set_time_lag(
@@ -554,7 +568,7 @@ class Go2NavEnv(DirectRLEnv):
         return height_map + self._offsets.view(offset_shape)
     
     def _apply_yaw_rotation(self, points: torch.Tensor) -> torch.Tensor:
-        angles = torch.deg2rad(self._rots).unsqueeze(-1)
+        angles = torch.deg2rad(self._rots_yaw).unsqueeze(-1)
         cos_angles = torch.cos(angles)
         sin_angles = torch.sin(angles)
         x_coord = points[..., 0]
@@ -563,6 +577,17 @@ class Go2NavEnv(DirectRLEnv):
         rotated_x = x_coord * cos_angles + z_coord * sin_angles
         rotated_z = -x_coord * sin_angles + z_coord * cos_angles
         return torch.stack((rotated_x, y_coord, rotated_z), dim=-1)
+    
+    def _apply_roll_rotation(self, points: torch.Tensor) -> torch.Tensor:
+        angles = torch.deg2rad(self._rots).unsqueeze(-1)
+        cos_angles = torch.cos(angles)
+        sin_angles = torch.sin(angles)
+        x_coord = points[..., 0]
+        y_coord = points[..., 1]
+        z_coord = points[..., 2]
+        rotated_y = y_coord * cos_angles - z_coord * sin_angles
+        rotated_z = y_coord * sin_angles + z_coord * cos_angles
+        return torch.stack((x_coord, rotated_y, rotated_z), dim=-1)
     
     def _zero_heightmap_cells(self, height_map):
         self.same_zeros_count += 1
@@ -591,6 +616,7 @@ class Go2NavEnv(DirectRLEnv):
         # rays_lidar = rays_rel_w
         if randomize and hasattr(self, "_rots"):
             rays_lidar = self._apply_yaw_rotation(rays_lidar)
+            rays_lidar = self._apply_roll_rotation(rays_lidar)
 
         if locomotion:
             x_cells = self.loc_x_cells
@@ -632,11 +658,12 @@ class Go2NavEnv(DirectRLEnv):
         flat_idx = env_ids * num_cells + x_idx * y_cells + y_idx
         height_map = torch.full((num_envs * num_cells,), -torch.inf, device=self.device)
         height_map.scatter_reduce_(0, flat_idx, z_vals, reduce="amax", include_self=True)
+        height_map += self.cfg.desired_base_height_loc
         height_map = torch.where(torch.isfinite(height_map), -height_map, torch.zeros_like(height_map))
-        # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
+  
         
-        # print(height_map + self.cfg.desired_base_height)
-        height_map = height_map.reshape(num_envs, num_cells) - self.cfg.desired_base_height
+        # print(height_map + self.cfg.desired_base_height_loc)
+        height_map = height_map.reshape(num_envs, num_cells) 
         if randomize:
             height_map = self._apply_offset(height_map)
             height_map += (2.0 * torch.rand_like(height_map) - 1.0) * float(0.01)

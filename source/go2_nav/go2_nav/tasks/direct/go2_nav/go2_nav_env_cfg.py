@@ -120,10 +120,10 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     sigma = 4.00
     n_zeros = 20
     max_reset_zeros_freq = 8
-    max_rot = 4.0
+    max_rot = 0.0
     max_offset = 0.05
     
-    desired_base_height = 0.28
+    desired_base_height_loc = 0.28
     
     # positions buffer
     length_mid_term: int = 50
@@ -168,7 +168,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     NUM_COLS = 1
     MAX_MAZE_ROWS = 8
     MAX_MAZE_COLS = 4
-    cell_size = 2.0
+    cell_size = 3.0
     # y <=> cols & x <=> rows
     # debug: flat ground plane terrain
     # terrain = TerrainImporterCfg(
@@ -194,10 +194,13 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             maze_max_rows=MAX_MAZE_ROWS,
             terrain_num_rows=NUM_ROWS,
             terrain_num_cols=NUM_COLS,
-            p_wall_dest=0.3,
+            p_wall_dest=0.1,
+            p_wall_door=0.2,
+            min_door_height=0.5,
+            door_width_range=[0.5, 1.0],
             curriculum=True,
             difficulty_range=(0.0, 1.0),
-            wall_height_range=(0.75, 2.0),
+            wall_height_range=(1.0, 3.0),
             wall_thickness_range=(0.1, 0.5),
             floor_thickness=0.06,
             algorithm="dfs",
@@ -205,16 +208,18 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             # stairs_prob_per_m2_range=(1.0, 1.0),
             # boxes_prob_per_m2_range=(0.0, 0.0),
             # rough_prob_per_m2_range=(0.0, 0.0),
-            stairs_prob_per_m2_range=(0.02, 0.08),
-            boxes_prob_per_m2_range=(0.04, 0.12),
-            rough_prob_per_m2_range=(0.10, 0.24),
-            stairs_step_height_range=(0.05, 0.08),
-            stairs_step_depth_range=(0.18, 0.24),
-            stairs_num_steps_range=(2, 15),
-            stairs_start_down_prob=0.4,
-            boxes_n_boxes_range=(10, 20),
-            boxes_h_boxes_range=(0.10, 0.20),
-            boxes_patch_size_ratio_range=(0.75, 0.90),
+            stairs_prob_per_m2_range=(0.0, 0.0),
+            boxes_prob_per_m2_range=(0.5, 0.5),
+            rough_prob_per_m2_range=(0.0, 0.0),
+            stairs_step_height_range=(0.05, 0.23),
+            stairs_step_depth_range=(0.3, 0.3),
+            stairs_num_steps_range=(10, 15),
+            stairs_start_down_prob=0.5,
+            boxes_n_boxes_range=(1, 4),
+            boxes_h_boxes_range=(0.4, 2.0),
+            boxes_l_boxes_range=(0.10, 0.6),
+            boxes_patch_size_ratio_range=(2.0, 2.0),
+            boxes_min_size=0.15,
             rough_n_rough_range=(16, 36),
             rough_h_rough_xy_range=(0.4, 0.6),
             rough_h_rough_z_range=(0.01, 0.15),

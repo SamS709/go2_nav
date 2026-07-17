@@ -27,5 +27,8 @@ Especially:
 
 The locomotion policy is trained to follow input velocities and walk on rough terrain thanks to a RayCaster (lidar).
 
-3. [ISAACLAB GITHUB]
-Accessible via the optimized_rag tools. Useful to get informations about the classes avaible in IsaacLab and used in the previous workspaces.
+3. [ISAACLAB DOCUMENTATION]
+Accessible via the optimized_rag tools. Useful to get informations about the IsaacLab source code and API.
+
+3. [TRIMESH DOCUMENTATION]
+Accessible via the optimized_rag tools. Useful to get informations about the trimesh source code and API.
