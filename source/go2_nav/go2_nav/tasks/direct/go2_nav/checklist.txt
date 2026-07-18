@@ -1,7 +1,6 @@
 To check
 
 - ensure the result from _get_goal_pos_xy_s is ok
-- Maze walls
 
 
 
@@ -28,3 +27,4 @@ HEIGHTMAP (N, 1, 37, 70) -> CNN -> (N, 32)|----->|-----|
 PROPRIO (N, 608) -> RNN -> (N, 128)|------------>|-----|
 
 - Maze consistency (terrain type)
+- Maze walls : all directions and destruction or door => no wall signal

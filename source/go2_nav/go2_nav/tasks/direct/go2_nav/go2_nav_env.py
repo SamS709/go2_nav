@@ -168,7 +168,7 @@ class Go2NavEnv(DirectRLEnv):
         self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
         self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
         self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
-        self.vis_envs = 5
+        self.vis_envs = 6
         
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -375,8 +375,7 @@ class Go2NavEnv(DirectRLEnv):
             teacher_height_scan = self._grid_delay_buffer.compute(teacher_height_scan)
             student_proprio = self._proprio_delay_buffer.compute(student_proprio)
             student_height_scan = self._grid_delay_buffer.compute(student_height_scan)
-        print(teacher_proprio.shape)
-        print(height_data_teacher.shape)
+
         return {
             "student_proprio": student_proprio,
             "student_height_scan": student_height_scan,
@@ -391,11 +390,14 @@ class Go2NavEnv(DirectRLEnv):
             translations=self._robot.data.root_pos_w[self.vis_envs].unsqueeze(0),
             orientations=self._robot.data.root_quat_w[self.vis_envs].unsqueeze(0),
         )
-        # terrain_coords: torch.Tensor = env_ids_to_terrain_coords(torch.tensor([self.vis_envs], device=self.device), self._terrain)
-        # mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(terrain_coords).clone()
-        # print(terrain_coords)
-        # print(mazes.shape)
-        # print(mazes[: , :, :, 0])
+        terrain_coords: torch.Tensor = env_ids_to_terrain_coords(torch.tensor([self.vis_envs], device=self.device), self._terrain)
+        mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(terrain_coords).clone()
+        print(terrain_coords)
+        print(mazes.shape)
+        print(mazes[: , :, :, 3]) # north
+        print(mazes[: , :, :, 1]) # south
+        print(mazes[: , :, :, 2]) # east
+        print(mazes[: , :, :, 4]) # west
         
         # num_rows=self.maze_registery.get_num_rows(terrain_coords)
         # print(num_rows[n])

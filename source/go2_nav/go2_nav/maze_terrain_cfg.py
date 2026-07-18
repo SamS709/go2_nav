@@ -531,10 +531,10 @@ def maze_terrain(
     #   - 1 -> stairs
     #   - 2 -> boxes
     #   - 3 -> grid
-    # maze_tensor[row, col, 1] -> North wall in [0,1] 1 if exixts else 0
-    # maze_tensor[row, col, 2] -> North wall in [0,1] 1 if exixts else 0
-    # maze_tensor[row, col, 3] -> North wall in [0,1] 1 if exixts else 0
-    # maze_tensor[row, col, 4] -> North wall in [0,1] 1 if exixts else 0
+    # maze_tensor[row, col, 1] -> South wall in [0,1] 1 if exixts else (or door) 0 (tranpose => north in algo = south in sim)
+    # maze_tensor[row, col, 2] -> East wall in [0,1] 1 if exixts else (or door) 0
+    # maze_tensor[row, col, 3] -> North wall in [0,1] 1 if exixts else (or door) 0
+    # maze_tensor[row, col, 4] -> West wall in [0,1] 1 if exixts else (or door) 0
     maze_tensor = torch.zeros((int(cfg.maze_max_rows), int(cfg.maze_max_cols), 5))
     
     
@@ -565,6 +565,8 @@ def maze_terrain(
                         )
                     )
                     maze_tensor[row, col, 1] = 0
+                    if row!=0:
+                        maze_tensor[row-1, col, 3] = 0
                 else:
                     meshes.append(
                         _box_mesh(
@@ -573,6 +575,8 @@ def maze_terrain(
                         )
                     )
                     maze_tensor[row, col, 1] = 1
+                    if row!=0:
+                        maze_tensor[row-1, col, 3] = 1
                 
             # East boundary
             dest_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_dest and col != maze_cols - 1            
@@ -637,6 +641,8 @@ def maze_terrain(
                         )
                     )
                     maze_tensor[row, col, 4] = 0
+                    if col != 0:
+                        maze_tensor[row, col-1, 2] = 0
                 else:
                     meshes.append(
                         _box_mesh(
@@ -645,6 +651,8 @@ def maze_terrain(
                         )
                     )
                     maze_tensor[row, col, 4] = 1
+                    if col != 0:
+                        maze_tensor[row, col-1, 2] = 1
 
             # ===========================================================================
             # STAIRS 

@@ -165,7 +165,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     
     # n_cols for the maze is constant fixed to maze_height
     vis = True
-    NUM_ROWS = 4
+    NUM_ROWS = 1
     NUM_COLS = 1
     MAX_MAZE_ROWS = 8
     MAX_MAZE_COLS = 4
@@ -196,7 +196,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             terrain_num_rows=NUM_ROWS,
             terrain_num_cols=NUM_COLS,
             p_wall_dest=0.1,
-            p_wall_door=0.2,
+            p_wall_door=0.3,
             min_door_height=0.5,
             door_width_range=[0.5, 1.0],
             curriculum=True,
