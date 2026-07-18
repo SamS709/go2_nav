@@ -249,7 +249,6 @@ class Go2NavEnv(DirectRLEnv):
         proprio_obs_loc, height_data_loc = self._build_locomotion_observations()
 
         self.prev_loc_actions.copy_(self.loc_actions)
-        # print(height_data_loc[0])
         self.loc_actions.copy_(self._query_locomotion_policy(proprio_obs_loc, height_data_loc))
         self.low_level_joint_targets = (
             self._robot.data.default_joint_pos + self.cfg.locomotion_action_scale * self.loc_actions
@@ -340,8 +339,8 @@ class Go2NavEnv(DirectRLEnv):
         height_data_student = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=False)
         height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         height_data_student = height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
-        torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        print(height_data_teacher[self.vis_envs][0,20:,25:45])
+        # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
+        # print(height_data_teacher[self.vis_envs][0,20:,25:45])
 
         
         goal_xy_s = self._get_goal_pos_s()
@@ -377,6 +376,8 @@ class Go2NavEnv(DirectRLEnv):
             teacher_height_scan = self._grid_delay_buffer.compute(teacher_height_scan)
             student_proprio = self._proprio_delay_buffer.compute(student_proprio)
             student_height_scan = self._grid_delay_buffer.compute(student_height_scan)
+        print(teacher_proprio.shape)
+        print(height_data_teacher.shape)
         return {
             "student_proprio": student_proprio,
             "student_height_scan": student_height_scan,
@@ -662,7 +663,6 @@ class Go2NavEnv(DirectRLEnv):
         height_map = torch.where(torch.isfinite(height_map), -height_map, torch.zeros_like(height_map))
   
         
-        # print(height_map + self.cfg.desired_base_height_loc)
         height_map = height_map.reshape(num_envs, num_cells) 
         if randomize:
             height_map = self._apply_offset(height_map)

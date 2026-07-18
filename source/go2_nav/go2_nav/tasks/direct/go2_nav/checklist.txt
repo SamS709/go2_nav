@@ -19,3 +19,9 @@ Checked:
 - WALLS destruction
 - STAIRS generation
 - GRID GENERATION
+
+
+-MODEL:
+HEIGHTMAP (N, 1, 37, 70) -> CNN -> (N, 32)|----->|-----|
+                                                 | MLP |---> (N, 12)
+PROPRIO (N, 608) -> RNN -> (N, 128)|------------>|-----|

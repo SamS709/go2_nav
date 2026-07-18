@@ -22,9 +22,9 @@ class Go2NavTeacherPretrainRunnerCfg(RslRlOnPolicyRunnerCfg):
     """Teacher pretraining on privileged observations."""
 
     num_steps_per_env = 24
-    max_iterations = 50000
+    max_iterations = 100000
     save_interval = 50
-    experiment_name = "go2_nav_planner_distillation"
+    experiment_name = "go2_nav_distillation"
     run_name = "teacher"
 
     obs_groups = {
@@ -90,7 +90,7 @@ class Go2NavDistillationRunnerCfg(RslRlDistillationRunnerCfg):
     """Student distillation from privileged teacher to lidar+history student."""
 
     num_steps_per_env = 24
-    max_iterations = 50000
+    max_iterations = 100000
     save_interval = 50
     experiment_name = "go2_nav_planner_distillation"
     run_name = "distillation"

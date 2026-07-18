@@ -7,6 +7,11 @@
 
 """Launch Isaac Sim Simulator first."""
 
+"""
+python scripts/rsl_rl/train.py --task Template-Go2-Nav-Direct-v0 --agent rsl_rl_teacher_cfg_entry_point --num_envs 12
+"""
+
+
 import argparse
 import sys
 
