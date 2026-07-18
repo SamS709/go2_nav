@@ -102,7 +102,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     sim_freq = 200
     policy_freq = sim_freq / 4
     sim_dt = 1 / sim_freq
-    episode_length_s = 120.0
+    episode_length_s = 30.0
     
     delay: bool = False
     delay_length: int = 4
@@ -164,6 +164,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Same for NUM_COLS == maze_max_cols
     
     # n_cols for the maze is constant fixed to maze_height
+    vis = True
     NUM_ROWS = 4
     NUM_COLS = 1
     MAX_MAZE_ROWS = 8
