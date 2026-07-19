@@ -31,7 +31,7 @@ class Go2NavEnv(DirectRLEnv):
     def __init__(self, cfg: Go2NavEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         self.tick_count_env: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
-        self.period_hist_mid_term = max(1, int(round(1 / self.cfg.freq_pos_mid_term)))
+        self.period_hist_short_term = max(1, int(round(1 / self.cfg.freq_pos_short_term)))
         self.period_hist_long_term = max(1, int(round(1 / self.cfg.freq_pos_long_term)))
         self.all_env_ids: torch.Tensor = torch.arange(self.num_envs, device=self.device)
         self._base_id_sensor, _base_name = self._contact_sensor.find_bodies("base")
@@ -65,8 +65,8 @@ class Go2NavEnv(DirectRLEnv):
 
 
         self.predicted_odom: torch.Tensor = torch.zeros(self.num_envs, 9, device=self.device)
-        self.pred_pos_hist_mid_term = torch.zeros(
-            self.num_envs, int(self.cfg.length_mid_term), 3, device=self.device
+        self.pred_pos_hist_short_term = torch.zeros(
+            self.num_envs, int(self.cfg.length_short_term), 3, device=self.device
         )
         self.pred_pos_hist_long_term = torch.zeros(
             self.num_envs, int(self.cfg.length_long_term), 3, device=self.device
@@ -261,12 +261,12 @@ class Go2NavEnv(DirectRLEnv):
         """
         
         
-        # mid_term history
-        should_update_mid = (self.tick_count_env % self.period_hist_mid_term == 0) 
-        rolled = torch.roll(self.pred_pos_hist_mid_term, shifts=-1, dims=1)
+        # short_term history
+        should_update_mid = (self.tick_count_env % self.period_hist_short_term == 0) 
+        rolled = torch.roll(self.pred_pos_hist_short_term, shifts=-1, dims=1)
         rolled[:, -1, :] = predicted_xyz
         mask = should_update_mid[:, None, None]
-        self.pred_pos_hist_mid_term = torch.where(mask, rolled, self.pred_pos_hist_mid_term)
+        self.pred_pos_hist_short_term = torch.where(mask, rolled, self.pred_pos_hist_short_term)
         
         # long_term history
         should_update_long = (self.tick_count_env % self.period_hist_long_term == 0) 
@@ -343,11 +343,11 @@ class Go2NavEnv(DirectRLEnv):
         
         goal_xy_s = self._get_goal_pos_s()
         goal_yaw_s = self._get_goal_yaw_s()
-        pred_pos_hist_mid_term = self.pred_pos_hist_mid_term.reshape(self.num_envs, -1)
+        pred_pos_hist_short_term = self.pred_pos_hist_short_term.reshape(self.num_envs, -1)
         pred_pos_hist_long_term = self.pred_pos_hist_long_term.reshape(self.num_envs, -1)
-        student_proprio = torch.cat([goal_xy_s, goal_yaw_s, pred_pos_hist_mid_term, pred_pos_hist_long_term], dim=-1)
+        student_proprio = torch.cat([goal_xy_s, goal_yaw_s, pred_pos_hist_short_term, pred_pos_hist_long_term, self.prev_cmd_vel], dim=-1)
 
-        true_odom = self._get_true_odom_r()
+        true_odom = self._get_true_odom_s()
         goal_delta = self.goal_pos_w - self._robot.data.root_pos_w
         yaw_error = self._wrap_to_pi(self.goal_yaw_w - self._quat_to_yaw(self._robot.data.root_quat_w))
         goal_heading = torch.stack((torch.sin(yaw_error), torch.cos(yaw_error)), dim=-1)
@@ -362,7 +362,7 @@ class Go2NavEnv(DirectRLEnv):
         maze_features = torch.cat([maze_encoded_flat, maze_remaining_flat], dim=-1)
 
         teacher_proprio = torch.cat(
-            [student_proprio.clone(), true_odom, goal_delta, goal_heading, self.cmd_vel, maze_features],
+            [student_proprio.clone(), true_odom, goal_delta, goal_heading, maze_features],
             dim=-1,
         )
 
@@ -394,15 +394,16 @@ class Go2NavEnv(DirectRLEnv):
         mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(terrain_coords).clone()
         print(terrain_coords)
         print(mazes.shape)
-        print(mazes[: , :, :, 3]) # north
-        print(mazes[: , :, :, 1]) # south
-        print(mazes[: , :, :, 2]) # east
-        print(mazes[: , :, :, 4]) # west
+        print(mazes[: , :, :, 0]) # type
+        # print(mazes[: , :, :, 3]) # north
+        # print(mazes[: , :, :, 1]) # south
+        # print(mazes[: , :, :, 2]) # east
+        # print(mazes[: , :, :, 4]) # west
         
         # num_rows=self.maze_registery.get_num_rows(terrain_coords)
         # print(num_rows[n])
         # maze_encoded = torch.nn.functional.one_hot(self.mazes[:,:,:,0].long(), self.maze_registery.num_terrain_types + 1)
-        # print(self.pred_pos_hist_mid_term[self.vis_envs][-1])
+        # print(self.pred_pos_hist_short_term[self.vis_envs][-1])
         # print(self.pred_pos_hist_long_term[self.vis_envs][-1])
 
     def _get_rewards(self) -> torch.Tensor:
@@ -421,7 +422,7 @@ class Go2NavEnv(DirectRLEnv):
         )
         self.prev_goal_distance.copy_(goal_distance.detach()) # store the prev goal dist
         
-        #penalize orientation only when next to the goal
+        # penalize orientation only when next to the goal
         rew_goal_orientation = torch.where(goal_distance < 0.3, torch.exp(
             -torch.square(yaw_error) / max(1e-4, float(self.cfg.goal_orientation_sigma))
         ), 0.0)
@@ -430,16 +431,16 @@ class Go2NavEnv(DirectRLEnv):
         
         pen_time_penalty = torch.ones_like(goal_distance)
 
-        true_odom = self._get_true_odom_r()
+        true_odom = self._get_true_odom_s()
         odom_error = torch.mean(torch.square(self.predicted_odom - true_odom), dim=-1)
         rew_odom_prediction = torch.exp(
-            -odom_error / max(1e-4, float(self.cfg.odom_prediction_scale))
+            -odom_error / max(1e-4, float(self.cfg.odom_prediction_sigma))
         )
 
         pen_cmd_rate = torch.sum(torch.square(self.cmd_vel - self.prev_cmd_vel), dim=-1)
         
         cmd_bounds = torch.sum(torch.where(self.cmd_vel >= 1.0, torch.abs(self.cmd_vel), 0.0), dim=-1)
-        pen_cmd_bounds = cmd_bounds + torch.sum(torch.where(self.cmd_vel <= 0.2, torch.exp(-10.0*torch.abs(self.cmd_vel)), 0.0), dim=-1)
+        pen_cmd_bounds = cmd_bounds + torch.sum(torch.where(self.cmd_vel <= 0.2, torch.exp(-torch.abs(self.cmd_vel)/self.cfg.cmd_vel_sigma), 0.0), dim=-1)
 
         rew_goal_bonus = self.goal_reached.float()
 
@@ -512,7 +513,7 @@ class Go2NavEnv(DirectRLEnv):
         default_root_state[:, :3] += self._terrain.env_origins[env_ids_tensor]
 
         self.predicted_odom[env_ids_tensor] = 0.0
-        self.pred_pos_hist_mid_term[env_ids_tensor] = 0.0
+        self.pred_pos_hist_short_term[env_ids_tensor] = 0.0
         self.pred_pos_hist_long_term[env_ids_tensor] = 0.0
         self.cmd_vel[env_ids_tensor] = 0.0
         self.prev_cmd_vel[env_ids_tensor] = 0.0
@@ -675,18 +676,23 @@ class Go2NavEnv(DirectRLEnv):
         # Keep ordering consistent with lidar_debug flow.
         return height_map
     
-    def _get_true_odom_r(self) -> torch.Tensor:
+    def _get_true_odom_s(self) -> torch.Tensor:
+        """Returns the odometry of the robot in its spawn frame."""
         root_lin_vel = self._robot.data.root_lin_vel_b
         root_ang_vel = self._robot.data.root_ang_vel_b
-        xyz_r = self._robot.data.root_pos_w - self.start_pos_w
-        return torch.cat(
-            [
-                xyz_r,
-                root_lin_vel,
-                root_ang_vel
-            ],
-            dim=-1,
-        )
+
+        delta_w = self._robot.data.root_pos_w - self.start_pos_w  # (num_envs, 3)
+
+        cos_yaw = torch.cos(-self.start_yaw_w)
+        sin_yaw = torch.sin(-self.start_yaw_w)
+
+        x_s = cos_yaw * delta_w[:, 0] - sin_yaw * delta_w[:, 1]
+        y_s = sin_yaw * delta_w[:, 0] + cos_yaw * delta_w[:, 1]
+        z_s = delta_w[:, 2]
+
+        xyz_s = torch.stack([x_s, y_s, z_s], dim=-1)
+
+        return torch.cat([xyz_s, root_lin_vel, root_ang_vel], dim=-1)
 
     def _get_goal_pos_s(self) -> torch.Tensor:
         """Goal position in start frame (2D, x forward, y left)."""

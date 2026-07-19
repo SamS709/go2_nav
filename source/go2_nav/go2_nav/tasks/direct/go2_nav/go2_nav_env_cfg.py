@@ -126,17 +126,17 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     desired_base_height_loc = 0.28
     
     # positions buffer
-    length_mid_term: int = 50
+    length_short_term: int = 50
     length_long_term: int = 50
-    freq_pos_mid_term: float = 1 # (policy_tick^(⁻1)) 50 recordings every 1 policy tick
-    freq_pos_long_term: float = 0.1 # (policy_tick^(⁻1)) 50 recordings every 10 policy_tick  
-    interval_pos_mid_term: float = 1 / freq_pos_mid_term
+    freq_pos_short_term: float = 0.1 # (policy_tick^(⁻1)) 50 recordings every 1 policy tick
+    freq_pos_long_term: float = 0.01 # (policy_tick^(⁻1)) 50 recordings every 10 policy_tick  
+    interval_pos_short_term: float = 1 / freq_pos_short_term
     interval_pos_long_term: float = 1 / freq_pos_long_term
     
     lidar_num_cells = int((nav_x_range[1] - nav_x_range[0]) / nav_cell_size) * int(
         (nav_y_range[1] - nav_y_range[0]) / nav_cell_size
     )
-    observation_space = lidar_num_cells + (length_mid_term + length_long_term) * 3
+    observation_space = lidar_num_cells + (length_short_term + length_long_term) * 3
     # Teacher receives student obs + privileged terms.
     teacher_observation_space = observation_space + 17
     # Expose critic state-space as privileged teacher observations for asymmetric PPO.
@@ -164,27 +164,16 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # Same for NUM_COLS == maze_max_cols
     
     # n_cols for the maze is constant fixed to maze_height
+    
+    # y <=> cols & x <=> rows
     vis = True
-    NUM_ROWS = 1
+
+    NUM_ROWS = 8
     NUM_COLS = 1
     MAX_MAZE_ROWS = 8
     MAX_MAZE_COLS = 4
     cell_size = 3.0
-    # y <=> cols & x <=> rows
-    # debug: flat ground plane terrain
-    # terrain = TerrainImporterCfg(
-    #     prim_path="/World/ground_plane",
-    #     terrain_type="plane",
-    #     collision_group=-1,
-    #     physics_material=sim_utils.RigidBodyMaterialCfg(
-    #         friction_combine_mode="multiply",
-    #         restitution_combine_mode="multiply",
-    #         static_friction=1.0,
-    #         dynamic_friction=1.0,
-    #         restitution=0.0,
-    #     ),
-    #     debug_vis=False,
-    # )
+    
     terrain: TerrainImporterCfg = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
@@ -232,6 +221,21 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         ),
         debug_vis=False,
     )
+    
+    # debug: flat ground plane terrain
+    # terrain = TerrainImporterCfg(
+    #     prim_path="/World/ground_plane",
+    #     terrain_type="plane",
+    #     collision_group=-1,
+    #     physics_material=sim_utils.RigidBodyMaterialCfg(
+    #         friction_combine_mode="multiply",
+    #         restitution_combine_mode="multiply",
+    #         static_friction=1.0,
+    #         dynamic_friction=1.0,
+    #         restitution=0.0,
+    #     ),
+    #     debug_vis=False,
+    # )
 
     # robot(s)
     robot_cfg: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
@@ -305,15 +309,14 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
       
 
     # goal and reward settings
-    rew_scale_goal_distance = 3.0
-    rew_scale_goal_progress = 7.0
-    rew_scale_goal_orientation = 2.0
-    rew_scale_time_penalty = -0.05
-    rew_scale_goal_bonus = 200.0
-    rew_scale_odom_prediction = 0.4
-    rew_scale_cmd_bounds = -0.02
-    rew_scale_cmd_rate = -0.001
-    rew_scale_upright = 0.5
+    rew_scale_goal_distance = 3.0 # in ]0, 1]
+    rew_scale_goal_progress = 7.0 # in ]0, +inf]
+    rew_scale_goal_orientation = 2.0 # in ]0, 1]
+    rew_scale_time_penalty = -0.05 # in ]0, +inf]
+    rew_scale_goal_bonus = 200.0 # in {0, 1}
+    rew_scale_odom_prediction = 0.4 # in ]0, 1]
+    rew_scale_cmd_bounds = -0.02 # in ]0, 1]
+    rew_scale_cmd_rate = -0.001 # in ]0, +inf]
     rew_scale_terminated = -5.0
     rew_scale_undesired_contacts = -10.0
 
@@ -321,7 +324,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     goal_orientation_sigma = 0.5
     goal_reached_distance = cell_size / 3.0
     goal_reached_yaw = 0.5
-    odom_prediction_scale = 5.0
+    odom_prediction_sigma = 0.5
+    cmd_vel_sigma = 0.1
 
     # reset and termination settings
     min_base_height = 0.18

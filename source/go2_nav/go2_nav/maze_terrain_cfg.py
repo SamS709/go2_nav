@@ -531,10 +531,11 @@ def maze_terrain(
     #   - 1 -> stairs
     #   - 2 -> boxes
     #   - 3 -> grid
-    # maze_tensor[row, col, 1] -> South wall in [0,1] 1 if exixts else (or door) 0 (tranpose => north in algo = south in sim)
+    # maze_tensor[row, col, 1] -> South wall in [0,1] 1 if exixts else (or door) 0 
     # maze_tensor[row, col, 2] -> East wall in [0,1] 1 if exixts else (or door) 0
     # maze_tensor[row, col, 3] -> North wall in [0,1] 1 if exixts else (or door) 0
     # maze_tensor[row, col, 4] -> West wall in [0,1] 1 if exixts else (or door) 0
+    # (tranpose => north in algo = south in sim)
     maze_tensor = torch.zeros((int(cfg.maze_max_rows), int(cfg.maze_max_cols), 5))
     
     
