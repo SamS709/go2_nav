@@ -309,16 +309,15 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
       
 
     # goal and reward settings
-    rew_scale_goal_distance = 3.0 # in ]0, 1]
-    rew_scale_goal_progress = 7.0 # in ]0, +inf]
-    rew_scale_goal_orientation = 2.0 # in ]0, 1]
-    rew_scale_time_penalty = -0.05 # in ]0, +inf]
+    rew_scale_goal_distance = 1.0 # in ]0, 1]
+    rew_scale_goal_progress = 1.0 # in ]0, +inf]
+    rew_scale_goal_orientation = 1.0 # in ]0, 1]
+    rew_scale_time_penalty = -0.001 # in ]0, +inf]
     rew_scale_goal_bonus = 200.0 # in {0, 1}
-    rew_scale_odom_prediction = 0.4 # in ]0, 1]
+    rew_scale_odom_prediction = 2.0 # in ]0, 1]
     rew_scale_cmd_bounds = -0.02 # in ]0, 1]
     rew_scale_cmd_rate = -0.001 # in ]0, +inf]
-    rew_scale_terminated = -5.0
-    rew_scale_undesired_contacts = -10.0
+    rew_scale_undesired_contacts = -1.0
 
     goal_distance_sigma = 2.0
     goal_orientation_sigma = 0.5
@@ -327,10 +326,4 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     odom_prediction_sigma = 0.5
     cmd_vel_sigma = 0.1
 
-    # reset and termination settings
-    min_base_height = 0.18
-    # projected_gravity_b[..., 2] is -1 when upright and increases as the robot tips.
-    max_projected_gravity_z = -0.2
-    reset_joint_pos_noise = 0.05
-    reset_joint_vel_noise = 0.10
     
