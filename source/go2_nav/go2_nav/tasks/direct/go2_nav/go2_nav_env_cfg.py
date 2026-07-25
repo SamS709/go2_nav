@@ -321,6 +321,11 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
 
     goal_distance_sigma = 2.0
     goal_orientation_sigma = 0.5
+    goal_orientation_gate_sigma = 0.5
+    goal_progress_clip = 0.5
+    stagnation_progress_eps = 0.01
+    stagnation_window = 100
+    rew_scale_stagnation = 0.01
     goal_reached_distance = cell_size / 3.0
     goal_reached_yaw = 0.5
     odom_prediction_sigma = 0.5

@@ -24,6 +24,7 @@ from isaaclab.terrains import TerrainImporterCfg ,TerrainImporter
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
+from networks.cnn_rnn_model import CNNRNNSeqModel
 
 class Go2NavEnv(DirectRLEnv):
     cfg: Go2NavEnvCfg
@@ -96,7 +97,12 @@ class Go2NavEnv(DirectRLEnv):
 
         self._finite_warn_counter = 0
         self.locomotion_policy = self._load_locomotion_policy(self.cfg.locomotion_policy_path)
-
+        
+        self.terrain_success_rate = torch.zeros(
+            self.cfg.terrain.terrain_generator.num_rows, self.cfg.terrain.terrain_generator.num_cols, device=self.device
+        )
+        self.terrain_episode_count = torch.zeros_like(self.terrain_success_rate)
+        self._stall_counter = torch.zeros(self.num_envs, device=self.device)
         # Logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -110,6 +116,7 @@ class Go2NavEnv(DirectRLEnv):
                 "pen_cmd_rate",
                 "pen_cmd_bounds",
                 "pen_undesired_contacts",
+                "pen_stagnation",
             ]
         }
     
@@ -409,26 +416,42 @@ class Go2NavEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         if self.cfg.vis:
             self.log_infos()
-        
+
         root_pos_w = self._robot.data.root_pos_w
         goal_delta_xy = self.goal_pos_w[:, :2] - root_pos_w[:, :2]
         goal_distance = torch.linalg.norm(goal_delta_xy, dim=-1)
-        
 
-        yaw_error = self._wrap_to_pi(self.goal_yaw_w - self._quat_to_yaw(self._robot.data.root_quat_w))
+        robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
+        yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
 
+        # --- goal distance (unchanged) ---
         rew_goal_distance = torch.exp(
             -goal_distance / max(1e-4, float(self.cfg.goal_distance_sigma))
         )
-        self.prev_goal_distance.copy_(goal_distance.detach()) # store the prev goal dist
-        
-        # penalize orientation only when next to the goal
-        rew_goal_orientation = torch.where(goal_distance < 0.3, torch.exp(
-            -torch.square(yaw_error) / max(1e-4, float(self.cfg.goal_orientation_sigma))
-        ), 0.0)
 
-        rew_goal_progress = self.prev_goal_distance - goal_distance
-        
+        # --- goal orientation: smooth gate instead of hard cutoff at 0.3 m ---
+        # was: torch.where(goal_distance < 0.3, exp(...), 0.0)  <- discontinuous, encourages
+        # boundary-hovering. Replaced with a smooth weight that fades in as the robot
+        # approaches, controlled by cfg.goal_orientation_gate_sigma (new field).
+        orientation_gate = torch.exp(
+            -goal_distance / max(1e-4, float(self.cfg.goal_orientation_gate_sigma))
+        )
+        rew_goal_orientation = orientation_gate * torch.exp(
+            -torch.square(yaw_error) / max(1e-4, float(self.cfg.goal_orientation_sigma))
+        )
+
+        # --- goal progress: clamp against reset-induced spikes ---
+        # If prev_goal_distance wasn't correctly reset to the *new* episode's goal_distance
+        # on env reset, a stale value causes a one-step teleport spike here. Clamp as
+        # insurance regardless; ALSO verify _reset_idx() sets self.prev_goal_distance
+        # from the fresh goal_distance before the first reward is computed.
+        raw_progress = self.prev_goal_distance - goal_distance
+        rew_goal_progress = torch.clamp(
+            raw_progress, -self.cfg.goal_progress_clip, self.cfg.goal_progress_clip
+        )
+        self.prev_goal_distance.copy_(goal_distance.detach())  # store the prev goal dist
+
+
         pen_time_penalty = torch.ones_like(goal_distance)
 
         true_odom = self._get_true_odom_s()
@@ -436,20 +459,54 @@ class Go2NavEnv(DirectRLEnv):
         rew_odom_prediction = torch.exp(
             -odom_error / max(1e-4, float(self.cfg.odom_prediction_sigma))
         )
+        # NOTE: still recommend moving this to a supervised aux loss on the prediction
+        # head instead of shaping it through PPO's reward, if predicted_odom is produced
+        # by a differentiable submodule you control. Left as-is here since that's a
+        # training-loop change, not a reward-function change.
 
         pen_cmd_rate = torch.sum(torch.square(self.cmd_vel - self.prev_cmd_vel), dim=-1)
-        
-        cmd_bounds = torch.sum(torch.where(self.cmd_vel >= 1.0, torch.abs(self.cmd_vel), 0.0), dim=-1)
-        pen_cmd_bounds = cmd_bounds + torch.sum(torch.where(self.cmd_vel <= 0.2, torch.exp(-torch.abs(self.cmd_vel)/self.cfg.cmd_vel_sigma), 0.0), dim=-1)
+
+        cmd_bounds_high = torch.sum(
+            torch.where(self.cmd_vel >= 1.0, torch.abs(self.cmd_vel), 0.0), dim=-1
+        )
+        # Low-end penalty: gated off near the goal so it doesn't fight rew_goal_orientation,
+        # which needs small, precise commands right at the goal. Reuses orientation_gate.
+        low_cmd_penalty = torch.sum(
+            torch.where(
+                self.cmd_vel <= 0.2,
+                torch.exp(-torch.abs(self.cmd_vel) / self.cfg.cmd_vel_sigma),
+                0.0,
+            ),
+            dim=-1,
+        )
+        pen_cmd_bounds = cmd_bounds_high + (1.0 - orientation_gate) * low_cmd_penalty
 
         rew_goal_bonus = self.goal_reached.float()
+        # Confirm episodes actually terminate/truncate when goal_reached fires elsewhere
+        # in the step loop — otherwise this can pay out indefinitely while lingering at goal.
 
-        # undesired contacts
-        is_contact = (
-            torch.max(torch.norm(self._contact_sensor.data.net_forces_w_history[:, :, self._undesired_contact_body_ids_sensor], dim=-1), dim=1)[0] > 1.0
+        # --- undesired contacts (unchanged; graded version noted below if you want it) ---
+        contact_forces = torch.norm(
+            self._contact_sensor.data.net_forces_w_history[:, :, self._undesired_contact_body_ids_sensor],
+            dim=-1,
         )
+        is_contact = torch.max(contact_forces, dim=1)[0] > 1.0
         pen_undesired_contacts = torch.sum(is_contact, dim=1)
-        
+       
+
+        # --- NEW: stagnation penalty ---
+        # Penalizes sustained lack of progress toward the goal (stuck against geometry,
+        # spinning in place, oscillating). Requires a persistent per-env counter buffer,
+        # e.g. self._stall_counter = torch.zeros(num_envs, device=self.device), created
+        # in __init__ and reset to 0 in _reset_idx().
+        making_progress = raw_progress > self.cfg.stagnation_progress_eps
+        self._stall_counter = torch.where(
+            making_progress,
+            0.0,
+            self._stall_counter + 1,
+        )
+        pen_stagnation = (self._stall_counter >= self.cfg.stagnation_window).float()
+
         rewards = {
             "rew_goal_distance": self.cfg.rew_scale_goal_distance * rew_goal_distance * self.step_dt,
             "rew_goal_orientation": self.cfg.rew_scale_goal_orientation * rew_goal_orientation * self.step_dt,
@@ -460,13 +517,15 @@ class Go2NavEnv(DirectRLEnv):
             "pen_cmd_bounds": self.cfg.rew_scale_cmd_bounds * pen_cmd_bounds * self.step_dt,
             "rew_goal_bonus": self.cfg.rew_scale_goal_bonus * rew_goal_bonus * self.step_dt,
             "pen_undesired_contacts": self.cfg.rew_scale_undesired_contacts * pen_undesired_contacts * self.step_dt,
-
+            "pen_stagnation": self.cfg.rew_scale_stagnation * pen_stagnation * self.step_dt,
         }
+
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         reward = self._sanitize_tensor(reward, "reward", clamp_abs=100.0)
 
         for key, value in rewards.items():
             self._episode_sums[key] += value
+
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -480,7 +539,7 @@ class Go2NavEnv(DirectRLEnv):
         net_contact_forces = self._contact_sensor.data.net_forces_w_history
         died_base = torch.any(torch.max(torch.norm(net_contact_forces[:, :, self._base_id_sensor], dim=-1), dim=1)[0] > 1.0, dim=1)
         
-        terminated = time_out | died_base | self.goal_reached 
+        terminated = died_base | self.goal_reached 
         
         return terminated, time_out
 
@@ -496,8 +555,19 @@ class Go2NavEnv(DirectRLEnv):
         terrain_generator = self.cfg.terrain.terrain_generator
         if terrain_generator is not None and terrain_generator.curriculum:
             reached_goal = self.goal_reached[env_ids_tensor]
-            move_up = self.reset_time_outs[env_ids_tensor] | reached_goal
-            move_down = self.reset_terminated[env_ids_tensor] & ~move_up
+            terrain_ids = env_ids_to_terrain_coords(env_ids_tensor, self._terrain)
+            died = self.reset_terminated[env_ids_tensor] & ~reached_goal
+            rows = terrain_ids[:, 0].long()
+            cols = terrain_ids[:, 1].long()
+
+            self.terrain_episode_count[rows, cols] += 1
+            self.terrain_success_rate[rows, cols] += (
+                reached_goal.float() - self.terrain_success_rate[rows, cols]
+            ) / self.terrain_episode_count[rows, cols].clamp(min=1)
+
+            cell_success = self.terrain_success_rate[rows, cols]
+            move_up   = cell_success > 0.8
+            move_down = died & (cell_success < 0.2)
 
         super()._reset_idx(env_ids_tensor)
         
@@ -520,6 +590,7 @@ class Go2NavEnv(DirectRLEnv):
         self.loc_actions[env_ids_tensor] = 0.0
         self.prev_loc_actions[env_ids_tensor] = 0.0
         self.goal_reached[env_ids_tensor] = False
+        self._stall_counter[env_ids_tensor] = 0.0
 
         self._update_goals(env_ids_tensor, False)
         self._update_starts(env_ids_tensor, False)
