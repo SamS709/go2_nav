@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from tensordict import TensorDict
 import os
 
 import torch
@@ -24,7 +25,7 @@ from isaaclab.terrains import TerrainImporterCfg ,TerrainImporter
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
-from .networks.cnn_rnn_model import CNNRNNSeqModel
+from .networks.cnn_rnn_model import CNNRNNNewModel
 
 class Go2NavEnv(DirectRLEnv):
     cfg: Go2NavEnvCfg
@@ -97,8 +98,8 @@ class Go2NavEnv(DirectRLEnv):
 
         self._finite_warn_counter = 0
         
-        self.locomotion_policy = self._load_locomotion_policy(self.cfg.locomotion_policy_path)
-        # self.odom_model = CNNRNNSeqModel()
+        self.locomotion_policy = self._load_locomotion_policy()
+        self.odom_model = self._load_odom_model()
         
         self.terrain_success_rate = torch.zeros(
             self.cfg.terrain.terrain_generator.num_rows, self.cfg.terrain.terrain_generator.num_cols, device=self.device
@@ -106,6 +107,10 @@ class Go2NavEnv(DirectRLEnv):
         self.terrain_episode_count = torch.zeros_like(self.terrain_success_rate)
         self._stall_counter = torch.zeros(self.num_envs, device=self.device)
         # Logging
+        
+        global_map_width = 100 # meters
+        global_map_height = 100
+        self.global_map = torch.zeros((global_map_width / self.cfg.nav_cell_size, global_map_height / self.cfg.nav_cell_size), device=self.device)
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -122,8 +127,49 @@ class Go2NavEnv(DirectRLEnv):
             ]
         }
     
-    def _load_locomotion_policy(self, policy_path: str):
-        resolved_path = os.path.expanduser(policy_path)
+    def _load_odom_model(self):
+        obs = TensorDict({
+            "height_scan": torch.randn(self.num_envs, 1, 64, 64),  # 2D: B, C, H, W
+            "proprio": torch.randn(self.num_envs, 32)           # 1D: B, D
+        })
+
+        # 2. Define groups exactly as they appear in obs
+        obs_groups = {
+            "policy": ["height_scan", "proprio"]  # Order matters for indexing if needed
+        }
+
+        # 3. Define CNN config for the 'height_map' group
+        cnn_cfg = {
+            "height_scan": {
+                "output_channels":[16, 32],
+                "kernel_size":[3, 3],
+                "stride":[2, 2],
+                "activation":"relu",
+                "max_pool":False,
+                "global_pool":"avg",
+            }
+        }
+
+        # 4. Initialize the model
+        model = CNNRNNNewModel(
+            obs=obs,
+            obs_groups=obs_groups,
+            obs_set="policy",
+            output_dim=9,  # e.g., [vx, vy] for velocity commands
+            hidden_dims=(128, 64),
+            cnn_cfg=cnn_cfg,
+            rnn_hidden_dim=64,
+            rnn_type="gru"
+        )
+
+        # 5. Test forward pass
+        output = model(obs)
+        print("Odom model output shape:")
+        print(output.shape) # Should be (batch_size, output_dim)
+        return model
+    
+    def _load_locomotion_policy(self):
+        resolved_path = os.path.expanduser(self.cfg.locomotion_policy_path)
         if not os.path.isabs(resolved_path):
             resolved_path = os.path.join(os.getcwd(), resolved_path)
 
