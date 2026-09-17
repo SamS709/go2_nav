@@ -24,7 +24,7 @@ from isaaclab.terrains import TerrainImporterCfg ,TerrainImporter
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
-from networks.cnn_rnn_model import CNNRNNSeqModel
+from .networks.cnn_rnn_model import CNNRNNSeqModel
 
 class Go2NavEnv(DirectRLEnv):
     cfg: Go2NavEnvCfg
@@ -96,7 +96,9 @@ class Go2NavEnv(DirectRLEnv):
         
 
         self._finite_warn_counter = 0
+        
         self.locomotion_policy = self._load_locomotion_policy(self.cfg.locomotion_policy_path)
+        # self.odom_model = CNNRNNSeqModel()
         
         self.terrain_success_rate = torch.zeros(
             self.cfg.terrain.terrain_generator.num_rows, self.cfg.terrain.terrain_generator.num_cols, device=self.device
