@@ -26,6 +26,7 @@ from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
 from .networks.cnn_rnn_model import CNNRNNNewModel
+from rsl_rl.models.rnn_model import RNNModel
 
 class Go2NavEnv(DirectRLEnv):
     cfg: Go2NavEnvCfg
@@ -36,6 +37,7 @@ class Go2NavEnv(DirectRLEnv):
         self.period_hist_short_term = max(1, int(round(1 / self.cfg.freq_pos_short_term)))
         self.period_hist_long_term = max(1, int(round(1 / self.cfg.freq_pos_long_term)))
         self.all_env_ids: torch.Tensor = torch.arange(self.num_envs, device=self.device)
+        
         self._base_id_sensor, _base_name = self._contact_sensor.find_bodies("base")
         self._feet_ids_sensor, _feet_name = self._contact_sensor.find_bodies(".*_foot")
         self._thigh_ids_sensor, _thigh_name = self._contact_sensor.find_bodies(".*_thigh")
@@ -59,14 +61,15 @@ class Go2NavEnv(DirectRLEnv):
         MAZE_REGISTRY.set_dims(self.cfg.NUM_ROWS, self.cfg.NUM_COLS, self.cfg.MAX_MAZE_ROWS, self.cfg.MAX_MAZE_COLS,self.device)
         self.maze_registery = MAZE_REGISTRY
 
-        self.pred_odom: torch.Tensor = torch.zeros(self.num_envs, 9, device=self.device)
+        self.odom_obs_proprio_hist = torch.zeros(self.num_envs, int(self.cfg.length_odom_hist), 45, device=self.device)
+        # The odometry model predicts 12 values: pose, linear velocity, and angular velocity.
+        self.pred_odom: torch.Tensor = torch.zeros(self.num_envs, 12, device=self.device)
         self.cmd_vel: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
 
         action_dim = int(self.cfg.action_space)
         self._num_joints = int(self._robot.data.default_joint_pos.shape[-1])
 
 
-        self.predicted_odom: torch.Tensor = torch.zeros(self.num_envs, 9, device=self.device)
         self.pred_pos_hist_short_term = torch.zeros(
             self.num_envs, int(self.cfg.length_short_term), 3, device=self.device
         )
@@ -108,9 +111,9 @@ class Go2NavEnv(DirectRLEnv):
         self._stall_counter = torch.zeros(self.num_envs, device=self.device)
         # Logging
         
-        global_map_width = 100 # meters
-        global_map_height = 100
-        self.global_map = torch.zeros((global_map_width / self.cfg.nav_cell_size, global_map_height / self.cfg.nav_cell_size), device=self.device)
+        # Creating the global map that gets filled from its center according to the current pred odom and the heightmap
+        self.global_map = torch.zeros(int(self.cfg.global_map_width / self.cfg.nav_cell_size), int(self.cfg.global_map_height / self.cfg.nav_cell_size), device=self.device)
+        print(f"Global map initialized with shape: {self.global_map.shape}")
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -127,46 +130,80 @@ class Go2NavEnv(DirectRLEnv):
             ]
         }
     
+    # def _load_map_model(self):
+    #     obs = TensorDict({
+    #         "height_scan": torch.randn(self.num_envs, 1, 64, 64),  # 2D: B, C, H, W
+    #         "proprio": torch.randn(self.num_envs, 32)           # 1D: B, D
+    #     })
+
+    #     # 2. Define groups exactly as they appear in obs
+    #     obs_groups = {
+    #         "policy": ["height_scan", "proprio"]  # Order matters for indexing if needed
+    #     }
+
+    #     # 3. Define CNN config for the 'height_map' group
+    #     cnn_cfg = {
+    #         "height_scan": {
+    #             "output_channels":[16, 32],
+    #             "kernel_size":[3, 3],
+    #             "stride":[2, 2],
+    #             "activation":"relu",
+    #             "max_pool":False,
+    #             "global_pool":"avg",
+    #         }
+    #     }
+
+    #     # 4. Initialize the model
+    #     model = CNNRNNNewModel(
+    #         obs=obs,
+    #         obs_groups=obs_groups,
+    #         obs_set="policy",
+    #         output_dim=9,  # e.g., [vx, vy] for velocity commands
+    #         hidden_dims=(128, 64),
+    #         cnn_cfg=cnn_cfg,
+    #         rnn_hidden_dim=64,
+    #         rnn_type="gru"
+    #     )
+
+    #     # 5. Test forward pass
+    #     output = model(obs)
+    #     print("Odom model output shape:")
+    #     print(output.shape) # Should be (batch_size, output_dim)
+    #     return model
+    
     def _load_odom_model(self):
-        obs = TensorDict({
-            "height_scan": torch.randn(self.num_envs, 1, 64, 64),  # 2D: B, C, H, W
-            "proprio": torch.randn(self.num_envs, 32)           # 1D: B, D
-        })
-
-        # 2. Define groups exactly as they appear in obs
-        obs_groups = {
-            "policy": ["height_scan", "proprio"]  # Order matters for indexing if needed
-        }
-
-        # 3. Define CNN config for the 'height_map' group
-        cnn_cfg = {
-            "height_scan": {
-                "output_channels":[16, 32],
-                "kernel_size":[3, 3],
-                "stride":[2, 2],
-                "activation":"relu",
-                "max_pool":False,
-                "global_pool":"avg",
+            obs = TensorDict({
+                "proprio": torch.randn(self.num_envs, 45 * self.cfg.length_odom_hist + self.pred_odom.shape[-1])           # 1D: B, D
+            })
+    
+            # 2. Define groups exactly as they appear in obs
+            obs_groups = {
+                "policy": ["proprio"]  # Order matters for indexing if needed
             }
-        }
-
-        # 4. Initialize the model
-        model = CNNRNNNewModel(
-            obs=obs,
-            obs_groups=obs_groups,
-            obs_set="policy",
-            output_dim=9,  # e.g., [vx, vy] for velocity commands
-            hidden_dims=(128, 64),
-            cnn_cfg=cnn_cfg,
-            rnn_hidden_dim=64,
-            rnn_type="gru"
-        )
-
-        # 5. Test forward pass
-        output = model(obs)
-        print("Odom model output shape:")
-        print(output.shape) # Should be (batch_size, output_dim)
-        return model
+            # 4. Initialize the model
+            model = RNNModel(
+                obs=obs,
+                obs_groups=obs_groups,
+                obs_set="policy",
+                output_dim=12,  # [x,y,z,r,p,y,vx,vy,vz,wx,wy,wz]
+                hidden_dims=(128, 128),
+                activation="identity",
+                obs_normalization=True,
+                rnn_num_layers=1,
+                rnn_hidden_dim=64,
+                rnn_type="gru"
+            )
+            # Move before the warm-up forward pass so the recurrent hidden state
+            # is initialized on the same device as the model parameters.
+            model = model.to(self.device)
+            model.eval()
+            model.reset()
+            with torch.inference_mode():
+                output = model(TensorDict({"proprio": obs["proprio"].to(self.device)}, batch_size=[self.num_envs]))
+            print("Odom model")
+            print(model) # Should be (batch_size, output_dim)
+            return model
+    
     
     def _load_locomotion_policy(self):
         resolved_path = os.path.expanduser(self.cfg.locomotion_policy_path)
@@ -290,14 +327,12 @@ class Go2NavEnv(DirectRLEnv):
         self.reset_zeros_freq = int(torch.randint(1, self.cfg.max_reset_zeros_freq + 1, (1,), device=self.device).item())        
     
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        # [x, y, z, vx, vy, vz, wx, wy, wz, vxd, vyd, vzd]
-
-        self.pred_odom.copy_(actions[:, :9])
-        self.cmd_vel.copy_(actions[:, 9:12])
-        self._update_predicted_position_history(self.pred_odom[:, :3])
-
-        # cmd_limits = torch.tensor(self.cfg.locomotion_cmd_limits, device=self.device, dtype=self.actions.dtype)
+        # actions = [vxd, vyd, wzd]
+        self.cmd_vel.copy_(actions[:, :3])
         self.prev_cmd_vel.copy_(self.cmd_vel)
+
+        # 1. Locomotion policy
+        # cmd_limits = torch.tensor(self.cfg.locomotion_cmd_limits, device=self.device, dtype=self.actions.dtype)
         
         proprio_obs_loc, height_data_loc = self._build_locomotion_observations()
 
@@ -306,13 +341,33 @@ class Go2NavEnv(DirectRLEnv):
         self.low_level_joint_targets = (
             self._robot.data.default_joint_pos + self.cfg.locomotion_action_scale * self.loc_actions
         )
+        
+        # 2. Odom model
+        odom_obs = self._build_odom_observations()
+        self.pred_odom.copy_(self._query_odom_model(odom_obs))
+        self._update_predicted_position_history(self.pred_odom[:, :3])
         self.tick_count_env += 1
         
 
+    def _update_global_map(self, agent_type: str, height_data: torch.Tensor) -> None:
+        xyz_pred = self.pred_odom[0:3].clone()
+        rpy_pred = self.pred_odom[3:6].clone()
+        # self.global_map_teacher
+        # self.global_map_student
+        
+    def _update_odom_obs_history(self, odom_obs: torch.Tensor) -> None:
+            
+            """
+            updating odom_obs_hist, filled by the back: the most recent are at the end of the buffer.
+            """
+            self.odom_obs_proprio_hist = torch.roll(self.odom_obs_proprio_hist, -1, 1)
+            self.odom_obs_proprio_hist[:, -1, :] = odom_obs
+            
+        
     def _update_predicted_position_history(self, predicted_xyz: torch.Tensor) -> None:
         
         """
-        updating predicted_pos_buffer, filled by the back: the most recent are at the ens of the buffer.
+        updating predicted_pos_buffer, filled by the back: the most recent are at the end of the buffer.
         """
         
         
@@ -341,46 +396,96 @@ class Go2NavEnv(DirectRLEnv):
         actions = actions.to(self.device)
 
         return actions
+    def _query_odom_model(self, odom_obs: torch.Tensor) -> torch.Tensor:
+        # Wrap the tensor in a TensorDict matching the model's expected input structure
+        obs_dict = TensorDict({
+            "proprio": odom_obs
+        }, batch_size=odom_obs.shape[:1])
+
+        with torch.inference_mode():
+            pred_odom: torch.Tensor = self.odom_model(obs_dict)
+
+        if isinstance(pred_odom, (tuple, list)):
+            pred_odom = pred_odom[0]
+        
+        pred_odom = pred_odom.to(self.device)
+
+    
+        return pred_odom
+    
 
     def _build_locomotion_observations(self) -> tuple[torch.Tensor, torch.Tensor]: 
-        base_ang_vel = self._robot.data.root_ang_vel_b
-        projected_gravity = self._robot.data.projected_gravity_b
-        joint_pos_rel = self._robot.data.joint_pos - self._robot.data.default_joint_pos
-        joint_vel = self._robot.data.joint_vel
-        
-        # height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize)
-        height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=True)
-        height_data = height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).unsqueeze(1)
-        # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        # cell_size_m = float(self.cfg.loc_cell_size)
-        # inv_cell_size = 1.0 / cell_size_m
-        # x_min, x_max = float(self.cfg.loc_x_range[0]), float(self.cfg.loc_x_range[1])
-        # y_min, y_max = float(self.cfg.loc_y_range[0]), float(self.cfg.loc_y_range[1])
-        # print(height_data_student.reshape(int((x_max - x_min)*inv_cell_size),int((y_max - y_min)*inv_cell_size)))
-        
-        # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))            
+            base_ang_vel = self._robot.data.root_ang_vel_b
+            projected_gravity = self._robot.data.projected_gravity_b
+            joint_pos_rel = self._robot.data.joint_pos - self._robot.data.default_joint_pos
+            joint_vel = self._robot.data.joint_vel
             
-        mock_cmd = torch.tensor([0.0, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype).repeat(
-            self.num_envs, 1
-        )
-
-        proprio_loc = torch.cat( 
-            [
-                base_ang_vel
-                + (2.0 * torch.rand_like(base_ang_vel) - 1.0) * float(0.1) * self.cfg.randomize,
-                projected_gravity
-                + (2.0 * torch.rand_like(projected_gravity) - 1.0) * float(0.05) * self.cfg.randomize,
-                mock_cmd,
-                # self.cmd_vel,
-                joint_pos_rel
-                + (2.0 * torch.rand_like(joint_pos_rel) - 1.0) * float(0.01) * self.cfg.randomize,
-                joint_vel + (2.0 * torch.rand_like(joint_vel) - 1.0) * float(0.1) * self.cfg.randomize,
-                self.loc_actions,
-            ],
-            dim=-1,
-        )
-        return self._sanitize_tensor(proprio_loc, "proprio_loc", clamp_abs=50.0), self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
-
+            # height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize)
+            height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=True)
+            height_data = height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).unsqueeze(1)
+    
+            torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
+            print(height_data[self.vis_envs])
+            # cell_size_m = float(self.cfg.loc_cell_size)
+            # inv_cell_size = 1.0 / cell_size_m
+            # x_min, x_max = float(self.cfg.loc_x_range[0]), float(self.cfg.loc_x_range[1])
+            # y_min, y_max = float(self.cfg.loc_y_range[0]), float(self.cfg.loc_y_range[1])
+            # print(height_data_student.reshape(int((x_max - x_min)*inv_cell_size),int((y_max - y_min)*inv_cell_size)))
+            
+            # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))            
+                
+            mock_cmd = torch.tensor([0.0, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype).repeat(
+                self.num_envs, 1
+            )
+    
+            proprio_loc = torch.cat( 
+                [
+                    base_ang_vel
+                    + (2.0 * torch.rand_like(base_ang_vel) - 1.0) * float(0.1) * self.cfg.randomize,
+                    projected_gravity
+                    + (2.0 * torch.rand_like(projected_gravity) - 1.0) * float(0.05) * self.cfg.randomize,
+                    mock_cmd,
+                    # self.cmd_vel,
+                    joint_pos_rel
+                    + (2.0 * torch.rand_like(joint_pos_rel) - 1.0) * float(0.01) * self.cfg.randomize,
+                    joint_vel + (2.0 * torch.rand_like(joint_vel) - 1.0) * float(0.1) * self.cfg.randomize,
+                    self.loc_actions,
+                ],
+                dim=-1,
+            )
+            return self._sanitize_tensor(proprio_loc, "proprio_loc", clamp_abs=50.0), self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
+    
+    def _build_odom_observations(self) -> torch.Tensor: 
+            base_ang_vel = self._robot.data.root_ang_vel_b
+            projected_gravity = self._robot.data.projected_gravity_b
+            joint_pos_rel = self._robot.data.joint_pos - self._robot.data.default_joint_pos
+            joint_vel = self._robot.data.joint_vel
+        
+                
+            mock_cmd = torch.tensor([0.0, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype).repeat(
+                self.num_envs, 1
+            )
+            # odom obs shape = 3 + 3 + 3 + 12 + 12 + 12 = 45 
+            odom_obs = torch.cat( 
+                [
+                    base_ang_vel
+                    + (2.0 * torch.rand_like(base_ang_vel) - 1.0) * float(0.1) * self.cfg.randomize,
+                    projected_gravity
+                    + (2.0 * torch.rand_like(projected_gravity) - 1.0) * float(0.05) * self.cfg.randomize,
+                    mock_cmd,
+                    # self.cmd_vel,
+                    joint_pos_rel
+                    + (2.0 * torch.rand_like(joint_pos_rel) - 1.0) * float(0.01) * self.cfg.randomize,
+                    joint_vel + (2.0 * torch.rand_like(joint_vel) - 1.0) * float(0.1) * self.cfg.randomize,
+                    self.loc_actions,
+                ],
+                dim=-1,
+            )
+            
+            self._update_odom_obs_history(odom_obs)
+            odom_hist_flat = self.odom_obs_proprio_hist.reshape(self.num_envs, -1)
+            return torch.cat([odom_hist_flat, self.pred_odom], dim=-1)
+    
 
 
     def _apply_action(self) -> None:
@@ -392,6 +497,8 @@ class Go2NavEnv(DirectRLEnv):
         height_data_student = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=False)
         height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
         height_data_student = height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1]).unsqueeze(1)
+        self._update_global_map("teacher", height_data_teacher)
+        self._update_global_map("student", height_data_student)
         # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
         # print(height_data_teacher[self.vis_envs][0,20:,25:45])
 
@@ -447,9 +554,10 @@ class Go2NavEnv(DirectRLEnv):
         )
         terrain_coords: torch.Tensor = env_ids_to_terrain_coords(torch.tensor([self.vis_envs], device=self.device), self._terrain)
         mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(terrain_coords).clone()
-        print(terrain_coords)
-        print(mazes.shape)
-        print(mazes[: , :, :, 0]) # type
+        # print(terrain_coords)
+        # print(mazes.shape)
+        # print(mazes[: , :, :, 0]) # type
+        
         # print(mazes[: , :, :, 3]) # north
         # print(mazes[: , :, :, 1]) # south
         # print(mazes[: , :, :, 2]) # east
@@ -503,12 +611,12 @@ class Go2NavEnv(DirectRLEnv):
         pen_time_penalty = torch.ones_like(goal_distance)
 
         true_odom = self._get_true_odom_s()
-        odom_error = torch.mean(torch.square(self.predicted_odom - true_odom), dim=-1)
+        odom_error = torch.mean(torch.square(self.pred_odom - true_odom), dim=-1)
         rew_odom_prediction = torch.exp(
             -odom_error / max(1e-4, float(self.cfg.odom_prediction_sigma))
         )
         # NOTE: still recommend moving this to a supervised aux loss on the prediction
-        # head instead of shaping it through PPO's reward, if predicted_odom is produced
+        # head instead of shaping it through PPO's reward, if pred_odom is produced
         # by a differentiable submodule you control. Left as-is here since that's a
         # training-loop change, not a reward-function change.
 
@@ -630,7 +738,7 @@ class Go2NavEnv(DirectRLEnv):
         default_root_state = self._robot.data.default_root_state[env_ids_tensor].clone()
         default_root_state[:, :3] += self._terrain.env_origins[env_ids_tensor]
 
-        self.predicted_odom[env_ids_tensor] = 0.0
+        self.pred_odom[env_ids_tensor] = 0.0
         self.pred_pos_hist_short_term[env_ids_tensor] = 0.0
         self.pred_pos_hist_long_term[env_ids_tensor] = 0.0
         self.cmd_vel[env_ids_tensor] = 0.0
@@ -811,7 +919,34 @@ class Go2NavEnv(DirectRLEnv):
 
         xyz_s = torch.stack([x_s, y_s, z_s], dim=-1)
 
-        return torch.cat([xyz_s, root_lin_vel, root_ang_vel], dim=-1)
+        # Current orientation in world frame
+        w, x, y, z = self._robot.data.root_quat_w.unbind(dim=-1)
+
+        roll_w = torch.atan2(
+            2.0 * (w * x + y * z),
+            1.0 - 2.0 * (x * x + y * y),
+        )
+
+        pitch_w = torch.asin(
+            torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0)
+        )
+
+        yaw_w = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+
+        # Orientation relative to spawn frame
+        roll_s = roll_w
+        pitch_s = pitch_w
+        yaw_s = torch.atan2(
+            torch.sin(yaw_w - self.start_yaw_w),
+            torch.cos(yaw_w - self.start_yaw_w),
+        )
+
+        rpy_s = torch.stack([roll_s, pitch_s, yaw_s], dim=-1)
+
+        return torch.cat([xyz_s, rpy_s, root_lin_vel, root_ang_vel], dim=-1)
 
     def _get_goal_pos_s(self) -> torch.Tensor:
         """Goal position in start frame (2D, x forward, y left)."""

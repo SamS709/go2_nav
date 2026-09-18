@@ -113,6 +113,9 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     nav_x_range = (-0.4, 7.0) # 37
     nav_y_range = (-7.0, 7.0) # 70
     
+    global_map_width = 100 # meters
+    global_map_height = 100 # meters
+    
     loc_cell_size = 0.1
     loc_x_range = [-0.5, 0.8]
     loc_y_range = [-0.5, 0.5]
@@ -124,6 +127,9 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     max_offset = 0.05
     
     desired_base_height_loc = 0.28
+    
+    # odom obs buffer
+    length_odom_hist = 10
     
     # positions buffer
     length_short_term: int = 50
@@ -168,7 +174,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # y <=> cols & x <=> rows
     vis = True
 
-    NUM_ROWS = 8
+    NUM_ROWS = 1
     NUM_COLS = 1
     MAX_MAZE_ROWS = 8
     MAX_MAZE_COLS = 4
