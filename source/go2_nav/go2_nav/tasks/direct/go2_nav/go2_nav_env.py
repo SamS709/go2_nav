@@ -66,11 +66,6 @@ class Go2NavEnv(DirectRLEnv):
         self.odom_obs_proprio_hist = torch.zeros(self.num_envs, int(self.cfg.length_odom_hist), 45, device=self.device)
         # The odometry model predicts 12 values: pose, linear velocity, and angular velocity.
         self.pred_odom: torch.Tensor = torch.zeros(self.num_envs, 12, device=self.device)
-        self.odom_origin_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
-        self.odom_origin_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
-        self.odom_origin_quat_w[:, 0] = 1.0
-        self.odom_origin_pos_w.copy_(self._robot.data.root_pos_w)
-        self.odom_origin_quat_w.copy_(self._robot.data.root_quat_w)
         self.cmd_vel: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
 
         action_dim = int(self.cfg.action_space)
@@ -378,7 +373,6 @@ class Go2NavEnv(DirectRLEnv):
         updating predicted_pos_buffer, filled by the back: the most recent are at the end of the buffer.
         """
         
-        
         # short_term history
         should_update_mid = (self.tick_count_env % self.period_hist_short_term == 0) 
         rolled = torch.roll(self.pred_pos_hist_short_term, shifts=-1, dims=1)
@@ -405,29 +399,11 @@ class Go2NavEnv(DirectRLEnv):
 
         return actions
 
-    def _compute_odom_target(self) -> torch.Tensor:
-        root_pos_w = self._robot.data.root_pos_w.clone()
-        root_quat_w = self._robot.data.root_quat_w.clone()
-
-        pos_rel, quat_rel = math_utils.subtract_frame_transforms(
-            self.odom_origin_pos_w, self.odom_origin_quat_w,
-            root_pos_w, root_quat_w,
-        )
-        roll, pitch, yaw = math_utils.euler_xyz_from_quat(quat_rel)
-        ori_rel = torch.stack([roll, pitch, yaw], dim=-1)
-
-        return torch.cat(
-            [pos_rel, ori_rel,
-            self._robot.data.root_lin_vel_b.clone(),
-            self._robot.data.root_ang_vel_b.clone()],
-            dim=-1,
-        )
-
     def _train_odom_step(self, odom_obs: torch.Tensor) -> torch.Tensor:
         with torch.inference_mode(False), torch.enable_grad():
 
             odom_obs = odom_obs.clone()
-            target = self._compute_odom_target()  # calls .clone() internally now, see below
+            target = self._get_true_odom_s()
 
             obs_dict = TensorDict({"proprio": odom_obs}, batch_size=odom_obs.shape[:1])
 
@@ -470,8 +446,9 @@ class Go2NavEnv(DirectRLEnv):
             height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize, locomotion=True)
             height_data = height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).unsqueeze(1)
     
-            torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-            print(height_data[self.vis_envs])
+            # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
+            # print(height_data[self.vis_envs])
+            
             # cell_size_m = float(self.cfg.loc_cell_size)
             # inv_cell_size = 1.0 / cell_size_m
             # x_min, x_max = float(self.cfg.loc_x_range[0]), float(self.cfg.loc_x_range[1])
@@ -829,8 +806,6 @@ class Go2NavEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(root_state, env_ids_tensor)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids_tensor)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids_tensor)
-        self.odom_origin_pos_w[env_ids_tensor] = root_state[:, :3]
-        self.odom_origin_quat_w[env_ids_tensor] = root_state[:, 3:7]
         # Logging
         extras = dict()
         for key in self._episode_sums.keys():
@@ -958,10 +933,12 @@ class Go2NavEnv(DirectRLEnv):
     
     def _get_true_odom_s(self) -> torch.Tensor:
         """Returns the odometry of the robot in its spawn frame."""
-        root_lin_vel = self._robot.data.root_lin_vel_b
-        root_ang_vel = self._robot.data.root_ang_vel_b
+        root_pos_w = self._robot.data.root_pos_w.clone()
+        root_quat_w = self._robot.data.root_quat_w.clone()
+        root_lin_vel = self._robot.data.root_lin_vel_b.clone()
+        root_ang_vel = self._robot.data.root_ang_vel_b.clone()
 
-        delta_w = self._robot.data.root_pos_w - self.start_pos_w  # (num_envs, 3)
+        delta_w = root_pos_w - self.start_pos_w  # (num_envs, 3)
 
         cos_yaw = torch.cos(-self.start_yaw_w)
         sin_yaw = torch.sin(-self.start_yaw_w)
@@ -973,7 +950,7 @@ class Go2NavEnv(DirectRLEnv):
         xyz_s = torch.stack([x_s, y_s, z_s], dim=-1)
 
         # Current orientation in world frame
-        w, x, y, z = self._robot.data.root_quat_w.unbind(dim=-1)
+        w, x, y, z = root_quat_w.unbind(dim=-1)
 
         roll_w = torch.atan2(
             2.0 * (w * x + y * z),
@@ -999,7 +976,7 @@ class Go2NavEnv(DirectRLEnv):
 
         rpy_s = torch.stack([roll_s, pitch_s, yaw_s], dim=-1)
 
-        return torch.cat([xyz_s, rpy_s, root_lin_vel, root_ang_vel], dim=-1)
+        return torch.cat([xyz_s, rpy_s, root_lin_vel, root_ang_vel], dim=-1).clone()
 
     def _get_goal_pos_s(self) -> torch.Tensor:
         """Goal position in start frame (2D, x forward, y left)."""
