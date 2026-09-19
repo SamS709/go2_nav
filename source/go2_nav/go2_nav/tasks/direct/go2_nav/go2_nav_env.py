@@ -11,10 +11,12 @@ from tensordict import TensorDict
 import os
 
 import torch
+import torch.nn.functional as F
 
 import isaaclab.sim as sim_utils
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.assets import Articulation, RigidObject
+import isaaclab.utils.math as math_utils
 from isaaclab.envs import DirectRLEnv
 from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
 from isaaclab.markers import VisualizationMarkers
@@ -64,6 +66,11 @@ class Go2NavEnv(DirectRLEnv):
         self.odom_obs_proprio_hist = torch.zeros(self.num_envs, int(self.cfg.length_odom_hist), 45, device=self.device)
         # The odometry model predicts 12 values: pose, linear velocity, and angular velocity.
         self.pred_odom: torch.Tensor = torch.zeros(self.num_envs, 12, device=self.device)
+        self.odom_origin_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self.odom_origin_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
+        self.odom_origin_quat_w[:, 0] = 1.0
+        self.odom_origin_pos_w.copy_(self._robot.data.root_pos_w)
+        self.odom_origin_quat_w.copy_(self._robot.data.root_quat_w)
         self.cmd_vel: torch.Tensor = torch.zeros(self.num_envs, 3, device=self.device)
 
         action_dim = int(self.cfg.action_space)
@@ -103,6 +110,7 @@ class Go2NavEnv(DirectRLEnv):
         
         self.locomotion_policy = self._load_locomotion_policy()
         self.odom_model = self._load_odom_model()
+        self.odom_optimizer = torch.optim.Adam(self.odom_model.parameters(), lr=1e-3)
         
         self.terrain_success_rate = torch.zeros(
             self.cfg.terrain.terrain_generator.num_rows, self.cfg.terrain.terrain_generator.num_cols, device=self.device
@@ -198,7 +206,7 @@ class Go2NavEnv(DirectRLEnv):
             model = model.to(self.device)
             model.eval()
             model.reset()
-            with torch.inference_mode():
+            with torch.no_grad():
                 output = model(TensorDict({"proprio": obs["proprio"].to(self.device)}, batch_size=[self.num_envs]))
             print("Odom model")
             print(model) # Should be (batch_size, output_dim)
@@ -344,7 +352,7 @@ class Go2NavEnv(DirectRLEnv):
         
         # 2. Odom model
         odom_obs = self._build_odom_observations()
-        self.pred_odom.copy_(self._query_odom_model(odom_obs))
+        self.pred_odom.copy_(self._train_odom_step(odom_obs))
         self._update_predicted_position_history(self.pred_odom[:, :3])
         self.tick_count_env += 1
         
@@ -396,24 +404,62 @@ class Go2NavEnv(DirectRLEnv):
         actions = actions.to(self.device)
 
         return actions
-    def _query_odom_model(self, odom_obs: torch.Tensor) -> torch.Tensor:
-        # Wrap the tensor in a TensorDict matching the model's expected input structure
-        obs_dict = TensorDict({
-            "proprio": odom_obs
-        }, batch_size=odom_obs.shape[:1])
 
-        with torch.inference_mode():
+    def _compute_odom_target(self) -> torch.Tensor:
+        root_pos_w = self._robot.data.root_pos_w.clone()
+        root_quat_w = self._robot.data.root_quat_w.clone()
+
+        pos_rel, quat_rel = math_utils.subtract_frame_transforms(
+            self.odom_origin_pos_w, self.odom_origin_quat_w,
+            root_pos_w, root_quat_w,
+        )
+        roll, pitch, yaw = math_utils.euler_xyz_from_quat(quat_rel)
+        ori_rel = torch.stack([roll, pitch, yaw], dim=-1)
+
+        return torch.cat(
+            [pos_rel, ori_rel,
+            self._robot.data.root_lin_vel_b.clone(),
+            self._robot.data.root_ang_vel_b.clone()],
+            dim=-1,
+        )
+
+    def _train_odom_step(self, odom_obs: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode(False), torch.enable_grad():
+
+            odom_obs = odom_obs.clone()
+            target = self._compute_odom_target()  # calls .clone() internally now, see below
+
+            obs_dict = TensorDict({"proprio": odom_obs}, batch_size=odom_obs.shape[:1])
+
+            self.odom_model.train()
             pred_odom: torch.Tensor = self.odom_model(obs_dict)
+            if isinstance(pred_odom, (tuple, list)):
+                pred_odom = pred_odom[0]
+            pred_odom = pred_odom.to(self.device)
 
-        if isinstance(pred_odom, (tuple, list)):
-            pred_odom = pred_odom[0]
-        
-        pred_odom = pred_odom.to(self.device)
+            pos_loss = F.mse_loss(pred_odom[:, 0:3], target[:, 0:3])
+            ori_loss = F.mse_loss(pred_odom[:, 3:6], target[:, 3:6])
+            lin_vel_loss = F.mse_loss(pred_odom[:, 6:9], target[:, 6:9])
+            ang_vel_loss = F.mse_loss(pred_odom[:, 9:12], target[:, 9:12])
+            loss = pos_loss + ori_loss + 0.5 * lin_vel_loss + 0.5 * ang_vel_loss
 
+            self.odom_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.odom_model.parameters(), max_norm=1.0)
+            self.odom_optimizer.step()
+            self.odom_model.detach_hidden_state()
+            self.odom_model.eval()
+
+            self.extras.setdefault("log", {})
+            self.extras["log"].update({
+                "odom/loss_total": loss.detach(),
+                "odom/loss_pos": pos_loss.detach(),
+                "odom/loss_ori": ori_loss.detach(),
+                "odom/loss_lin_vel": lin_vel_loss.detach(),
+                "odom/loss_ang_vel": ang_vel_loss.detach(),
+            })
+            return pred_odom.detach()
     
-        return pred_odom
-    
-
     def _build_locomotion_observations(self) -> tuple[torch.Tensor, torch.Tensor]: 
             base_ang_vel = self._robot.data.root_ang_vel_b
             projected_gravity = self._robot.data.projected_gravity_b
@@ -726,6 +772,11 @@ class Go2NavEnv(DirectRLEnv):
             move_down = died & (cell_success < 0.2)
 
         super()._reset_idx(env_ids_tensor)
+
+        odom_reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        odom_reset_mask[env_ids_tensor] = True
+        with torch.no_grad():
+            self.odom_model.reset(odom_reset_mask)
         
         self.tick_count_env[env_ids_tensor] = 0
 
@@ -778,6 +829,8 @@ class Go2NavEnv(DirectRLEnv):
         self._robot.write_root_pose_to_sim(root_state, env_ids_tensor)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids_tensor)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids_tensor)
+        self.odom_origin_pos_w[env_ids_tensor] = root_state[:, :3]
+        self.odom_origin_quat_w[env_ids_tensor] = root_state[:, 3:7]
         # Logging
         extras = dict()
         for key in self._episode_sums.keys():
