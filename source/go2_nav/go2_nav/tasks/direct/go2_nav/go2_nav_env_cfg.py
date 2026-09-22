@@ -107,14 +107,16 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     delay: bool = False
     delay_length: int = 4
     
-    # Planner output: [x, y, z, vx, vy, vz, wx, wy, wz, cmd_x, cmd_y, cmd_z]
-    action_space = 12
+    # Planner output: [cmd_x, cmd_y, cmd_z]
+    action_space = 3
     nav_cell_size = 0.2
-    nav_x_range = (-0.4, 7.0) # 37
-    nav_y_range = (-7.0, 7.0) # 70
+    nav_x_range = (-0.4, 3.0) # 17
+    nav_y_range = (-3.0, 3.0) # 30
     
-    global_map_width = 100 # meters
-    global_map_height = 100 # meters
+    map_width = 50 # meters
+    map_height = 50 # meters
+    map_cell_size = 0.2 # meters per cell
+    map_lidar_radius = 2.0 # meters: the distance revealed around the robot 
     
     loc_cell_size = 0.1
     loc_x_range = [-0.5, 0.8]
@@ -174,8 +176,8 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # y <=> cols & x <=> rows
     vis = True
 
-    NUM_ROWS = 1
-    NUM_COLS = 1
+    NUM_ROWS = 3
+    NUM_COLS = 3
     MAX_MAZE_ROWS = 8
     MAX_MAZE_COLS = 4
     cell_size = 3.0
