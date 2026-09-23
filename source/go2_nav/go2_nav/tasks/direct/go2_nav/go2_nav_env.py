@@ -85,7 +85,6 @@ class Go2NavEnv(DirectRLEnv):
         )
         self.maze_registery = MAZE_REGISTRY
         self._build_maze_path_tables()
-
         self.odom_obs_proprio_hist = torch.zeros(
             self.num_envs, int(self.cfg.length_odom_hist), 45, device=self.device
         )
@@ -242,7 +241,7 @@ class Go2NavEnv(DirectRLEnv):
         self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
         self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
         self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
-        self.vis_envs = 6
+        self.vis_envs = 1
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -621,9 +620,10 @@ class Go2NavEnv(DirectRLEnv):
         original_rows = spawn_rows + torch.round(local[:, 0] / cell_size).long()
         original_cols = spawn_cols - torch.round(local[:, 1] / cell_size).long()
         recorded_rows = self._maze_rows - 1 - original_rows
+        recorded_cols = original_cols
         recorded_rows = torch.maximum(torch.zeros_like(recorded_rows), recorded_rows)
         recorded_rows = torch.minimum(recorded_rows, self._maze_rows - 1)
-        recorded_cols = torch.maximum(torch.zeros_like(original_cols), original_cols)
+        recorded_cols = torch.maximum(torch.zeros_like(recorded_cols), recorded_cols)
         recorded_cols = torch.minimum(recorded_cols, self._maze_cols - 1)
         return recorded_rows, recorded_cols
 
@@ -1144,12 +1144,12 @@ class Go2NavEnv(DirectRLEnv):
             translations=self._robot.data.root_pos_w[self.vis_envs].unsqueeze(0),
             orientations=self._robot.data.root_quat_w[self.vis_envs].unsqueeze(0),
         )
-        terrain_coords: torch.Tensor = env_ids_to_terrain_coords(
-            torch.tensor([self.vis_envs], device=self.device), self._terrain
-        )
-        mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(
-            terrain_coords
-        ).clone()
+        # terrain_coords: torch.Tensor = env_ids_to_terrain_coords(
+        #     torch.tensor([self.vis_envs], device=self.device), self._terrain
+        # )
+        # mazes: torch.Tensor = self.maze_registery.get_mazes_terrain_coords(
+        #     terrain_coords
+        # ).clone()
         # print(terrain_coords)
         # print(mazes.shape)
         # print(mazes[: , :, :, 0]) # type
@@ -1173,7 +1173,7 @@ class Go2NavEnv(DirectRLEnv):
         goal_delta_xy = self.goal_pos_w[:, :2] - root_pos_w[:, :2]
         goal_distance = torch.linalg.norm(goal_delta_xy, dim=-1)
         path_distance = self._compute_maze_path_distance(root_pos_w)
-
+        print(path_distance[self.vis_envs])
         robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
         yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
 
@@ -1909,7 +1909,7 @@ class Go2NavEnv(DirectRLEnv):
                 root_pos = self._robot.data.root_pos_w[env_idx, :2].detach().cpu()
                 gx = (float(root_pos[0]) - x_min) / res
                 gy = (float(root_pos[1]) - y_min) / res
-                axes[0].plot(gy, gx, "r+", markersize=15, markeredgewidth=2)
+                axes[0].plot(gx, gy, "r+", markersize=15, markeredgewidth=2)
 
                 robot_rows, robot_cols = self._world_to_maze_cells(self._robot.data.root_pos_w)
                 goal_rows, goal_cols = self._world_to_maze_cells(self.goal_pos_w)
@@ -1939,10 +1939,26 @@ class Go2NavEnv(DirectRLEnv):
                         tuple(self.goal_pos_w[env_idx, :2].detach().cpu().tolist())
                     ]
                     path_xy = np.asarray(path_xy)
-                    path_x = (path_xy[:, 1] - y_min) / res
-                    path_y = (path_xy[:, 0] - x_min) / res
+                    path_x = (path_xy[:, 0] - x_min) / res
+                    path_y = (path_xy[:, 1] - y_min) / res
                     axes[0].plot(path_x, path_y, color="yellow", linewidth=2.0, marker="o", markersize=3)
                     axes[0].plot(path_x[-1], path_y[-1], "b*", markersize=12)
+
+                    # The true map is expressed in the episode start frame, so
+                    # project the same world-space route into that local frame.
+                    if hasattr(self, "true_map") and len(axes) > 1:
+                        start_pos = self.start_pos_w[env_idx, :2].detach().cpu().numpy()
+                        start_yaw = float(self.start_yaw_w[env_idx].detach().cpu())
+                        cos_yaw = np.cos(start_yaw)
+                        sin_yaw = np.sin(start_yaw)
+                        delta = path_xy - start_pos
+                        local_x = cos_yaw * delta[:, 0] + sin_yaw * delta[:, 1]
+                        local_y = -sin_yaw * delta[:, 0] + cos_yaw * delta[:, 1]
+                        true_map_w, true_map_h = self.true_map.shape[1:]
+                        true_x = local_x / float(self.cfg.map_cell_size) + true_map_w / 2.0 - 0.5
+                        true_y = local_y / float(self.cfg.map_cell_size) + true_map_h / 2.0 - 0.5
+                        axes[1].plot(true_x, true_y, color="yellow", linewidth=2.0, marker="o", markersize=3)
+                        axes[1].plot(true_x[-1], true_y[-1], "b*", markersize=12)
 
             fig.tight_layout()
             fig.savefig(out_path, dpi=120)

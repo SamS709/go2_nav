@@ -280,7 +280,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
             "goal": sim_utils.UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
                 scale=(0.5, 0.5, 0.5),
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0)),
             ),
         },
     )

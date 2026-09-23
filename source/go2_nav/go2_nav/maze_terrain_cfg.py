@@ -827,7 +827,7 @@ def maze_terrain(
     maze_tensor_recorded = maze_tensor.clone()
     maze_tensor_recorded[:maze_rows] = maze_tensor[:maze_rows].flip(0)
     MAZE_REGISTRY.record(maze_tensor_recorded, maze_rows)
-    print(maze_rows)
+    # print(    maze_tensor_recorded)
 
     return meshes, origin
 
