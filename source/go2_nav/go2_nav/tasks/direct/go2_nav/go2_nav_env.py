@@ -241,7 +241,7 @@ class Go2NavEnv(DirectRLEnv):
         self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
         self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
         self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
-        self.vis_envs = 1
+        self.vis_envs = 6
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -546,35 +546,78 @@ class Go2NavEnv(DirectRLEnv):
         self._global_heightfield_y_min = y_min
         self._heightfield_ready = True    
 
-    def _build_maze_path_tables(self) -> None:
-        """Precompute cell-center shortest paths for every terrain environment."""
-        env_ids = torch.arange(self.num_envs, device=self.device)
+    def _build_maze_path_tables(self, env_ids: torch.Tensor | None = None) -> None:
+        """Build or incrementally update shared shortest-path tables."""
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            initial_build = not hasattr(self, "_maze_terrain_coords")
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long).reshape(-1)
+            initial_build = not hasattr(self, "_maze_terrain_coords")
+
+        if env_ids.numel() == 0:
+            return
+
         terrain_coords = env_ids_to_terrain_coords(env_ids, self._terrain)
+        if initial_build:
+            changed_ids = env_ids
+        else:
+            changed = torch.any(
+                terrain_coords != self._maze_terrain_coords[env_ids], dim=1
+            )
+            changed_ids = env_ids[changed]
+            if changed_ids.numel() == 0:
+                return
+            terrain_coords = env_ids_to_terrain_coords(changed_ids, self._terrain)
+
         layouts = self.maze_registery.get_mazes_terrain_coords(terrain_coords).detach().cpu()
         maze_rows = self.maze_registery.get_num_rows(terrain_coords).detach().cpu()
         maze_cols = torch.full_like(maze_rows, int(self.cfg.MAX_MAZE_COLS))
         max_cols = int(self.cfg.MAX_MAZE_COLS)
         max_cells = int(self.cfg.MAX_MAZE_ROWS) * max_cols
 
-        self._maze_layouts = layouts
-        self._maze_rows = maze_rows.to(self.device)
-        self._maze_cols = maze_cols.to(self.device)
-        self._maze_path_distances = torch.full(
-            (self.num_envs, max_cells, max_cells),
-            float("inf"),
-            device=self.device,
-        )
+        if initial_build:
+            self._maze_terrain_coords = torch.empty(
+                (self.num_envs, 2), dtype=terrain_coords.dtype, device=self.device
+            )
+            self._maze_layouts = torch.empty(
+                (self.num_envs, *layouts.shape[1:]), dtype=layouts.dtype
+            )
+            self._maze_rows = torch.empty(self.num_envs, dtype=torch.long, device=self.device)
+            self._maze_cols = torch.empty_like(self._maze_rows)
+            self._maze_path_table_ids = torch.empty(
+                self.num_envs, dtype=torch.long, device=self.device
+            )
+            self._maze_path_distances = torch.empty(
+                (0, max_cells, max_cells), device=self.device
+            )
+            self._maze_table_ids_by_key: dict[tuple[int, int, bytes], int] = {}
 
-        cached_tables: dict[tuple[int, int, bytes], torch.Tensor] = {}
-        for env_idx in range(self.num_envs):
-            rows = int(maze_rows[env_idx])
-            cols = int(maze_cols[env_idx])
-            active_layout = layouts[env_idx, :rows, :cols].to(torch.int8).numpy()
+        self._maze_terrain_coords[changed_ids] = terrain_coords
+        self._maze_layouts[changed_ids.cpu()] = layouts
+        self._maze_rows[changed_ids] = maze_rows.to(self.device)
+        self._maze_cols[changed_ids] = maze_cols.to(self.device)
+
+        new_tables = []
+        for local_idx, env_idx in enumerate(changed_ids.tolist()):
+            rows = int(maze_rows[local_idx])
+            cols = int(maze_cols[local_idx])
+            active_layout = layouts[local_idx, :rows, :cols].to(torch.int8).numpy()
             key = (rows, cols, active_layout.tobytes())
-            if key not in cached_tables:
-                cached_tables[key] = self._compute_maze_distance_table(active_layout, rows, cols)
-            table = cached_tables[key]
-            self._maze_path_distances[env_idx, : rows * cols, : rows * cols] = table.to(self.device)
+            table_id = self._maze_table_ids_by_key.get(key)
+            if table_id is None:
+                table_id = len(self._maze_table_ids_by_key)
+                self._maze_table_ids_by_key[key] = table_id
+                table = self._compute_maze_distance_table(active_layout, rows, cols)
+                padded_table = torch.full((max_cells, max_cells), float("inf"))
+                padded_table[: rows * cols, : rows * cols] = table
+                new_tables.append(padded_table)
+            self._maze_path_table_ids[env_idx] = table_id
+
+        if new_tables:
+            self._maze_path_distances = torch.cat(
+                [self._maze_path_distances, torch.stack(new_tables).to(self.device)], dim=0
+            )
 
     @staticmethod
     def _compute_maze_distance_table(layout, rows: int, cols: int) -> torch.Tensor:
@@ -645,8 +688,9 @@ class Go2NavEnv(DirectRLEnv):
         max_cols = int(self.cfg.MAX_MAZE_COLS)
         robot_flat = robot_rows * max_cols + robot_cols
         goal_flat = goal_rows * max_cols + goal_cols
-        env_ids = torch.arange(self.num_envs, device=self.device)
-        cell_distance = self._maze_path_distances[env_ids, robot_flat, goal_flat]
+        cell_distance = self._maze_path_distances[
+            self._maze_path_table_ids, robot_flat, goal_flat
+        ]
 
         robot_centers = self._maze_cell_centers_world(robot_rows, robot_cols)
         goal_centers = self._maze_cell_centers_world(goal_rows, goal_cols)
@@ -1173,7 +1217,6 @@ class Go2NavEnv(DirectRLEnv):
         goal_delta_xy = self.goal_pos_w[:, :2] - root_pos_w[:, :2]
         goal_distance = torch.linalg.norm(goal_delta_xy, dim=-1)
         path_distance = self._compute_maze_path_distance(root_pos_w)
-        print(path_distance[self.vis_envs])
         robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
         yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
 
@@ -1334,7 +1377,8 @@ class Go2NavEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        self._plot_map_s(env_ids_tensor, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
+        if env_ids is not None and len(env_ids) != self.num_envs and self.cfg.plot:
+            self._plot_map_s(env_ids_tensor, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
         self._robot.reset(env_ids)
         move_up = None
         move_down = None
@@ -1377,7 +1421,14 @@ class Go2NavEnv(DirectRLEnv):
         self.tick_count_env[env_ids_tensor] = 0
 
         if move_up is not None and move_down is not None:
+            # FOR DEBUGGING ####################################################
+            # move_up = torch.ones(env_ids_tensor.shape[0], dtype=torch.bool, device=self.device)    #
+            # move_down = torch.zeros(env_ids_tensor.shape[0], dtype=torch.bool, device=self.device) #
+            ####################################################################
             self._terrain.update_env_origins(env_ids_tensor, move_up, move_down)
+            # Curriculum changes terrain_levels, so environments may now refer to
+            # different maze layouts than when the lookup table was built.
+            self._build_maze_path_tables(env_ids_tensor)
 
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]

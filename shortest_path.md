@@ -62,7 +62,7 @@ A transition is legal only when both sides have no wall.
 
 ### `_build_maze_path_tables`
 
-Called once during environment initialization after `MAZE_REGISTRY` has been populated.
+Called during environment initialization after `MAZE_REGISTRY` has been populated, and incrementally for the environments involved in a curriculum reset.
 
 For each vectorized environment it:
 
@@ -72,7 +72,9 @@ For each vectorized environment it:
 4. Computes an all-pairs shortest-distance table.
 5. Stores the table on the simulation device.
 
-Identical maze layouts are cached, so environments sharing the same terrain do not repeat the BFS calculation.
+Identical maze layouts are cached, so environments sharing the same terrain do not repeat the BFS calculation or store duplicate matrices. `_maze_path_distances` has one entry per unique maze, while `_maze_path_table_ids[env]` selects the shared entry for each environment.
+
+At reset, the function receives only the reset environment IDs. It compares their current terrain coordinates with `_maze_terrain_coords`. If an environment stayed on the same terrain, it is skipped. If its curriculum level changed, its layout and row count are refreshed. A known layout reuses its table ID; only a previously unseen layout runs BFS and appends a new shared table.
 
 The final lookup has this conceptual form:
 

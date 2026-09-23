@@ -116,7 +116,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     map_width = 50 # meters
     map_height = 50 # meters
     map_cell_size = 0.2 # meters per cell
-    map_lidar_radius = 2.0 # meters: the distance revealed around the robot 
+    map_lidar_radius = 2.5 # meters: the distance revealed around the robot 
     
     loc_cell_size = 0.1
     loc_x_range = [-0.5, 0.8]
@@ -175,6 +175,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     
     # y <=> cols & x <=> rows
     vis = True
+    plot = True
 
     NUM_ROWS = 3
     NUM_COLS = 3
@@ -265,7 +266,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
         pattern_cfg=patterns.LidarPatternCfg(
             channels=64, vertical_fov_range=[0.0, 90.0], horizontal_fov_range=[-180, 180], horizontal_res=2.0
         ),
-        max_distance=10.0,
+        max_distance=5.0,
         debug_vis=True,
     )
 
