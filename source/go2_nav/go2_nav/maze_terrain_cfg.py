@@ -821,7 +821,12 @@ def maze_terrain(
 
     origin = _rotate90_xy(origin)
     #flip the rows, so that the maze is oriented correctly when looking at the sim for x and rows increasing
-    MAZE_REGISTRY.record(maze_tensor.flip(0), maze_rows)
+    # Flip only the active maze rows. Flipping the full padded tensor would move a
+    # curriculum maze into the last rows of the registry and leave the active prefix
+    # looking like an open maze to consumers such as the path planner.
+    maze_tensor_recorded = maze_tensor.clone()
+    maze_tensor_recorded[:maze_rows] = maze_tensor[:maze_rows].flip(0)
+    MAZE_REGISTRY.record(maze_tensor_recorded, maze_rows)
     print(maze_rows)
 
     return meshes, origin

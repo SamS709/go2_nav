@@ -84,6 +84,7 @@ class Go2NavEnv(DirectRLEnv):
             self.device,
         )
         self.maze_registery = MAZE_REGISTRY
+        self._build_maze_path_tables()
 
         self.odom_obs_proprio_hist = torch.zeros(
             self.num_envs, int(self.cfg.length_odom_hist), 45, device=self.device
@@ -200,6 +201,9 @@ class Go2NavEnv(DirectRLEnv):
             self.num_envs, 4, device=self.device
         )
         self.prev_goal_distance: torch.Tensor = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.prev_path_distance: torch.Tensor = torch.zeros(
             self.num_envs, device=self.device
         )
         self.goal_reached: torch.Tensor = torch.zeros(
@@ -542,6 +546,145 @@ class Go2NavEnv(DirectRLEnv):
         self._global_heightfield_x_min = x_min
         self._global_heightfield_y_min = y_min
         self._heightfield_ready = True    
+
+    def _build_maze_path_tables(self) -> None:
+        """Precompute cell-center shortest paths for every terrain environment."""
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        terrain_coords = env_ids_to_terrain_coords(env_ids, self._terrain)
+        layouts = self.maze_registery.get_mazes_terrain_coords(terrain_coords).detach().cpu()
+        maze_rows = self.maze_registery.get_num_rows(terrain_coords).detach().cpu()
+        maze_cols = torch.full_like(maze_rows, int(self.cfg.MAX_MAZE_COLS))
+        max_cols = int(self.cfg.MAX_MAZE_COLS)
+        max_cells = int(self.cfg.MAX_MAZE_ROWS) * max_cols
+
+        self._maze_layouts = layouts
+        self._maze_rows = maze_rows.to(self.device)
+        self._maze_cols = maze_cols.to(self.device)
+        self._maze_path_distances = torch.full(
+            (self.num_envs, max_cells, max_cells),
+            float("inf"),
+            device=self.device,
+        )
+
+        cached_tables: dict[tuple[int, int, bytes], torch.Tensor] = {}
+        for env_idx in range(self.num_envs):
+            rows = int(maze_rows[env_idx])
+            cols = int(maze_cols[env_idx])
+            active_layout = layouts[env_idx, :rows, :cols].to(torch.int8).numpy()
+            key = (rows, cols, active_layout.tobytes())
+            if key not in cached_tables:
+                cached_tables[key] = self._compute_maze_distance_table(active_layout, rows, cols)
+            table = cached_tables[key]
+            self._maze_path_distances[env_idx, : rows * cols, : rows * cols] = table.to(self.device)
+
+    @staticmethod
+    def _compute_maze_distance_table(layout, rows: int, cols: int) -> torch.Tensor:
+        """Return all-pairs shortest cell distances for a recorded maze layout."""
+        import numpy as np
+
+        cell_count = rows * cols
+        distances = np.full((cell_count, cell_count), np.inf, dtype=np.float32)
+        for source in range(cell_count):
+            source_row, source_col = divmod(source, cols)
+            distances[source, source] = 0.0
+            queue = [(source_row, source_col)]
+            head = 0
+            while head < len(queue):
+                row, col = queue[head]
+                head += 1
+                current = row * cols + col
+                neighbors = (
+                    (-1, 0, 3, 1),  # recorded row - 1: current north/south wall channels
+                    (1, 0, 1, 3),
+                    (0, -1, 4, 2),
+                    (0, 1, 2, 4),
+                )
+                for row_delta, col_delta, current_wall, neighbor_wall in neighbors:
+                    next_row = row + row_delta
+                    next_col = col + col_delta
+                    if not (0 <= next_row < rows and 0 <= next_col < cols):
+                        continue
+                    if layout[row, col, current_wall] or layout[next_row, next_col, neighbor_wall]:
+                        continue
+                    next_cell = next_row * cols + next_col
+                    if np.isinf(distances[source, next_cell]):
+                        distances[source, next_cell] = distances[source, current] + 1.0
+                        queue.append((next_row, next_col))
+        return torch.from_numpy(distances)
+
+    def _world_to_maze_cells(self, positions_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert world XY positions to recorded maze row and column indices."""
+        local = positions_w[:, :2] - self._terrain.env_origins[:, :2]
+        cell_size = float(self.cfg.terrain.terrain_generator.sub_terrains["maze"].cell_size)
+        spawn_rows = self._maze_rows // 2
+        spawn_cols = self._maze_cols // 2
+        original_rows = spawn_rows + torch.round(local[:, 0] / cell_size).long()
+        original_cols = spawn_cols - torch.round(local[:, 1] / cell_size).long()
+        recorded_rows = self._maze_rows - 1 - original_rows
+        recorded_rows = torch.maximum(torch.zeros_like(recorded_rows), recorded_rows)
+        recorded_rows = torch.minimum(recorded_rows, self._maze_rows - 1)
+        recorded_cols = torch.maximum(torch.zeros_like(original_cols), original_cols)
+        recorded_cols = torch.minimum(recorded_cols, self._maze_cols - 1)
+        return recorded_rows, recorded_cols
+
+    def _maze_cell_centers_world(self, rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+        """Return world XY centers for recorded maze cells."""
+        cell_size = float(self.cfg.terrain.terrain_generator.sub_terrains["maze"].cell_size)
+        original_rows = self._maze_rows - 1 - rows
+        original_cols = cols
+        spawn_rows = self._maze_rows // 2
+        spawn_cols = self._maze_cols // 2
+        local_x = (original_rows - spawn_rows).to(torch.float32) * cell_size
+        local_y = -(original_cols - spawn_cols).to(torch.float32) * cell_size
+        return self._terrain.env_origins[:, :2] + torch.stack((local_x, local_y), dim=-1)
+
+    def _compute_maze_path_distance(self, positions_w: torch.Tensor) -> torch.Tensor:
+        """Compute shortest maze distance plus the partial distances within endpoint cells."""
+        robot_rows, robot_cols = self._world_to_maze_cells(positions_w)
+        goal_rows, goal_cols = self._world_to_maze_cells(self.goal_pos_w)
+        max_cols = int(self.cfg.MAX_MAZE_COLS)
+        robot_flat = robot_rows * max_cols + robot_cols
+        goal_flat = goal_rows * max_cols + goal_cols
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        cell_distance = self._maze_path_distances[env_ids, robot_flat, goal_flat]
+
+        robot_centers = self._maze_cell_centers_world(robot_rows, robot_cols)
+        goal_centers = self._maze_cell_centers_world(goal_rows, goal_cols)
+        partial_distance = torch.linalg.norm(positions_w[:, :2] - robot_centers, dim=-1)
+        partial_distance += torch.linalg.norm(self.goal_pos_w[:, :2] - goal_centers, dim=-1)
+        distance = cell_distance * float(self.cfg.terrain.terrain_generator.sub_terrains["maze"].cell_size)
+        euclidean = torch.linalg.norm(self.goal_pos_w[:, :2] - positions_w[:, :2], dim=-1)
+        return torch.where(torch.isfinite(distance), distance + partial_distance, euclidean)
+
+    def _shortest_maze_path_cells(self, env_idx: int, start: tuple[int, int], goal: tuple[int, int]) -> list[tuple[int, int]]:
+        """Return a shortest path in recorded cell coordinates for plotting."""
+        layout = self._maze_layouts[env_idx].numpy()
+        rows = int(self._maze_rows[env_idx])
+        cols = int(self._maze_cols[env_idx])
+        queue = [start]
+        previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        head = 0
+        while head < len(queue):
+            row, col = queue[head]
+            head += 1
+            if (row, col) == goal:
+                break
+            for row_delta, col_delta, current_wall, neighbor_wall in ((-1, 0, 3, 1), (1, 0, 1, 3), (0, -1, 4, 2), (0, 1, 2, 4)):
+                next_cell = (row + row_delta, col + col_delta)
+                if not (0 <= next_cell[0] < rows and 0 <= next_cell[1] < cols):
+                    continue
+                if layout[row, col, current_wall] or layout[next_cell[0], next_cell[1], neighbor_wall] or next_cell in previous:
+                    continue
+                previous[next_cell] = (row, col)
+                queue.append(next_cell)
+        if goal not in previous:
+            return [start]
+        path = []
+        cell = goal
+        while cell is not None:
+            path.append(cell)
+            cell = previous[cell]
+        return list(reversed(path))
     
     def _reveal_around(self, env_ids: torch.Tensor, robot_xy_w: torch.Tensor, radius: float = None) -> None:
         radius = self.cfg.map_lidar_radius  
@@ -1029,13 +1172,14 @@ class Go2NavEnv(DirectRLEnv):
         root_pos_w = self._robot.data.root_pos_w
         goal_delta_xy = self.goal_pos_w[:, :2] - root_pos_w[:, :2]
         goal_distance = torch.linalg.norm(goal_delta_xy, dim=-1)
+        path_distance = self._compute_maze_path_distance(root_pos_w)
 
         robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
         yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
 
         # --- goal distance (unchanged) ---
         rew_goal_distance = torch.exp(
-            -goal_distance / max(1e-4, float(self.cfg.goal_distance_sigma))
+            -path_distance / max(1e-4, float(self.cfg.goal_distance_sigma))
         )
 
         # --- goal orientation: smooth gate instead of hard cutoff at 0.3 m ---
@@ -1054,13 +1198,12 @@ class Go2NavEnv(DirectRLEnv):
         # on env reset, a stale value causes a one-step teleport spike here. Clamp as
         # insurance regardless; ALSO verify _reset_idx() sets self.prev_goal_distance
         # from the fresh goal_distance before the first reward is computed.
-        raw_progress = self.prev_goal_distance - goal_distance
+        raw_progress = self.prev_path_distance - path_distance
         rew_goal_progress = torch.clamp(
             raw_progress, -self.cfg.goal_progress_clip, self.cfg.goal_progress_clip
         )
-        self.prev_goal_distance.copy_(
-            goal_distance.detach()
-        )  # store the prev goal dist
+        self.prev_goal_distance.copy_(goal_distance.detach())
+        self.prev_path_distance.copy_(path_distance.detach())
 
         pen_time_penalty = torch.ones_like(goal_distance)
 
@@ -1297,6 +1440,9 @@ class Go2NavEnv(DirectRLEnv):
         self.prev_goal_distance[env_ids_tensor] = torch.linalg.norm(
             self.goal_pos_w[env_ids_tensor, :2] - default_root_state[:, :2], dim=-1
         )
+        self.prev_path_distance[env_ids_tensor] = self._compute_maze_path_distance(
+            self.start_pos_w
+        )[env_ids_tensor]
 
         self._robot.write_root_pose_to_sim(root_state, env_ids_tensor)
         self._robot.write_root_velocity_to_sim(
@@ -1763,7 +1909,40 @@ class Go2NavEnv(DirectRLEnv):
                 root_pos = self._robot.data.root_pos_w[env_idx, :2].detach().cpu()
                 gx = (float(root_pos[0]) - x_min) / res
                 gy = (float(root_pos[1]) - y_min) / res
-                axes[0].plot(gx, gy, "r+", markersize=15, markeredgewidth=2)
+                axes[0].plot(gy, gx, "r+", markersize=15, markeredgewidth=2)
+
+                robot_rows, robot_cols = self._world_to_maze_cells(self._robot.data.root_pos_w)
+                goal_rows, goal_cols = self._world_to_maze_cells(self.goal_pos_w)
+                path_cells = self._shortest_maze_path_cells(
+                    env_idx,
+                    (int(robot_rows[env_idx]), int(robot_cols[env_idx])),
+                    (int(goal_rows[env_idx]), int(goal_cols[env_idx])),
+                )
+                maze_rows = int(self._maze_rows[env_idx])
+                maze_cols = int(self._maze_cols[env_idx])
+                cell_size = float(self.cfg.terrain.terrain_generator.sub_terrains["maze"].cell_size)
+                spawn_row = maze_rows // 2
+                spawn_col = maze_cols // 2
+                path_xy = []
+                for path_row, path_col in path_cells:
+                    original_row = maze_rows - 1 - path_row
+                    local_x = (original_row - spawn_row) * cell_size
+                    local_y = -(path_col - spawn_col) * cell_size
+                    path_xy.append(
+                        (
+                            float(self._terrain.env_origins[env_idx, 0].cpu()) + local_x,
+                            float(self._terrain.env_origins[env_idx, 1].cpu()) + local_y,
+                        )
+                    )
+                if path_xy:
+                    path_xy = [tuple(root_pos.tolist())] + path_xy + [
+                        tuple(self.goal_pos_w[env_idx, :2].detach().cpu().tolist())
+                    ]
+                    path_xy = np.asarray(path_xy)
+                    path_x = (path_xy[:, 1] - y_min) / res
+                    path_y = (path_xy[:, 0] - x_min) / res
+                    axes[0].plot(path_x, path_y, color="yellow", linewidth=2.0, marker="o", markersize=3)
+                    axes[0].plot(path_x[-1], path_y[-1], "b*", markersize=12)
 
             fig.tight_layout()
             fig.savefig(out_path, dpi=120)
