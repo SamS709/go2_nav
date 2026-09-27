@@ -111,7 +111,6 @@ class Go2NavEnv(DirectRLEnv):
             self.num_envs, self._num_joints, device=self.device
         )
         self.prev_loc_actions: torch.Tensor = torch.zeros_like(self.loc_actions)
-        self.low_level_joint_targets = self._robot.data.default_joint_pos.clone()
 
         if self.cfg.delay == True:
             self._proprio_delay_buffer: DelayBuffer = DelayBuffer(
@@ -123,7 +122,7 @@ class Go2NavEnv(DirectRLEnv):
                 self._proprio_delay_buffer.set_time_lag(
                     torch.randint(
                         low=0,
-                        high=self.cfg.history_length,
+                        high=self.cfg.delay_length,
                         size=(self.num_envs,),
                         device=self.device,
                     )
@@ -179,7 +178,7 @@ class Go2NavEnv(DirectRLEnv):
             for key in [
                 "rew_goal_distance",
                 "rew_goal_progress",
-                "rew_goal_orientation",
+                "pen_goal_orientation",
                 "pen_goal_penalty",
                 "rew_goal_bonus",
                 "rew_odom_pred",
@@ -198,9 +197,6 @@ class Go2NavEnv(DirectRLEnv):
         self.goal_yaw_w: torch.Tensor = torch.zeros(self.num_envs, device=self.device)
         self.goal_quat_w: torch.Tensor = torch.zeros(
             self.num_envs, 4, device=self.device
-        )
-        self.prev_goal_distance: torch.Tensor = torch.zeros(
-            self.num_envs, device=self.device
         )
         self.prev_path_distance: torch.Tensor = torch.zeros(
             self.num_envs, device=self.device
@@ -237,11 +233,11 @@ class Go2NavEnv(DirectRLEnv):
         self._offsets.uniform_(-self.cfg.max_offset, self.cfg.max_offset)
         self._setup_lidar_values()
         self._create_gaussian_heightmap(self.loc_x_cells, self.loc_y_cells)
-
-        self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
-        self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
-        self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
-        self.vis_envs = 6
+        if self.cfg.vis:
+            self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
+            self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
+            self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
+            self.vis_envs = 6
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -392,14 +388,7 @@ class Go2NavEnv(DirectRLEnv):
 
     def _build_map_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
 
-        height_data = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, locomotion=False
-        )
-        height_data = (
-            height_data.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
-            .flip(dims=[1])
-            .unsqueeze(1)
-        )
+        
         # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
         # print(height_data[self.vis_envs])
 
@@ -411,10 +400,10 @@ class Go2NavEnv(DirectRLEnv):
 
         # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))
 
-        proprio_loc = self.pred_odom.clone()
+        pred_odom = self.pred_odom.clone()
         return self._sanitize_tensor(
-            proprio_loc, "obs_map_odom", clamp_abs=1000.0
-        ), self._sanitize_tensor(height_data, "obs_map_height", clamp_abs=100.0)
+            pred_odom, "obs_map_odom", clamp_abs=1000.0
+        ), self.nav_height_map.clone()
         
     def _update_true_map(self, env_ids: torch.Tensor) -> None:
         n = env_ids.numel()
@@ -682,23 +671,68 @@ class Go2NavEnv(DirectRLEnv):
         return self._terrain.env_origins[:, :2] + torch.stack((local_x, local_y), dim=-1)
 
     def _compute_maze_path_distance(self, positions_w: torch.Tensor) -> torch.Tensor:
-        """Compute shortest maze distance plus the partial distances within endpoint cells."""
+        """Compute maze distance using progress along the next path corridor."""
         robot_rows, robot_cols = self._world_to_maze_cells(positions_w)
         goal_rows, goal_cols = self._world_to_maze_cells(self.goal_pos_w)
         max_cols = int(self.cfg.MAX_MAZE_COLS)
+        max_rows = int(self.cfg.MAX_MAZE_ROWS)
         robot_flat = robot_rows * max_cols + robot_cols
         goal_flat = goal_rows * max_cols + goal_cols
         cell_distance = self._maze_path_distances[
             self._maze_path_table_ids, robot_flat, goal_flat
         ]
+        cell_size = float(self.cfg.terrain.terrain_generator.sub_terrains["maze"].cell_size)
 
         robot_centers = self._maze_cell_centers_world(robot_rows, robot_cols)
         goal_centers = self._maze_cell_centers_world(goal_rows, goal_cols)
-        partial_distance = torch.linalg.norm(positions_w[:, :2] - robot_centers, dim=-1)
-        partial_distance += torch.linalg.norm(self.goal_pos_w[:, :2] - goal_centers, dim=-1)
-        distance = cell_distance * float(self.cfg.terrain.terrain_generator.sub_terrains["maze"].cell_size)
-        euclidean = torch.linalg.norm(self.goal_pos_w[:, :2] - positions_w[:, :2], dim=-1)
-        return torch.where(torch.isfinite(distance), distance + partial_distance, euclidean)
+
+        # Select the neighboring cell that is one hop closer to the goal. The
+        # distance table is measured in cell hops, so a direct neighbor must have
+        # distance one from the current cell.
+        best_next_dist = torch.full_like(cell_distance, float("inf"))
+        next_rows = robot_rows.clone()
+        next_cols = robot_cols.clone()
+        for row_delta, col_delta in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            candidate_rows = robot_rows + row_delta
+            candidate_cols = robot_cols + col_delta
+            valid = (
+                (candidate_rows >= 0)
+                & (candidate_rows < max_rows)
+                & (candidate_cols >= 0)
+                & (candidate_cols < max_cols)
+            )
+            nbr_rows = candidate_rows.clamp(0, max_rows - 1)
+            nbr_cols = candidate_cols.clamp(0, max_cols - 1)
+            nbr_flat = nbr_rows * max_cols + nbr_cols
+
+            step_dist = self._maze_path_distances[
+                self._maze_path_table_ids, robot_flat, nbr_flat
+            ]
+            nbr_to_goal = self._maze_path_distances[
+                self._maze_path_table_ids, nbr_flat, goal_flat
+            ]
+            connected = valid & (step_dist == 1)
+            candidate_dist = torch.where(
+                connected, nbr_to_goal, torch.full_like(nbr_to_goal, float("inf"))
+            )
+
+            improve = candidate_dist < best_next_dist
+            best_next_dist = torch.where(improve, candidate_dist, best_next_dist)
+            next_rows = torch.where(improve, nbr_rows, next_rows)
+            next_cols = torch.where(improve, nbr_cols, next_cols)
+
+        next_centers = self._maze_cell_centers_world(next_rows, next_cols)
+        direction = next_centers - robot_centers
+        direction_norm = torch.linalg.norm(direction, dim=-1, keepdim=True).clamp_min(1e-6)
+        unit_direction = direction / direction_norm
+        forward_progress = ((positions_w[:, :2] - robot_centers) * unit_direction).sum(dim=-1)
+        forward_progress = forward_progress.clamp(min=-cell_size, max=cell_size)
+        # print(((positions_w[:, :2] - robot_centers) * unit_direction)[self.vis_envs])
+        distance = cell_distance * cell_size - forward_progress
+        euclidean_scaled = torch.linalg.norm(self.goal_pos_w[:, :2] - positions_w[:, :2], dim=-1) / cell_size
+        same_cell = (robot_rows == goal_rows) & (robot_cols == goal_cols)
+        distance = torch.where(same_cell, euclidean_scaled, distance)
+        return torch.where(torch.isfinite(distance), distance, euclidean_scaled)
 
     def _shortest_maze_path_cells(self, env_idx: int, start: tuple[int, int], goal: tuple[int, int]) -> list[tuple[int, int]]:
         """Return a shortest path in recorded cell coordinates for plotting."""
@@ -908,39 +942,17 @@ class Go2NavEnv(DirectRLEnv):
 
     def _build_odom_observations(self) -> torch.Tensor:
         base_ang_vel = self._robot.data.root_ang_vel_b
-        projected_gravity = self._robot.data.projected_gravity_b
-        joint_pos_rel = self._robot.data.joint_pos - self._robot.data.default_joint_pos
-        joint_vel = self._robot.data.joint_vel
 
-        mock_cmd = torch.tensor(
-            [0.0, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype
-        ).repeat(self.num_envs, 1)
+
         # odom obs shape = 3 + 3 + 3 + 12 + 12 + 12 = 45
         odom_obs = torch.cat(
             [
-                base_ang_vel
-                + (2.0 * torch.rand_like(base_ang_vel) - 1.0)
-                * float(0.1)
-                * self.cfg.randomize,
-                projected_gravity
-                + (2.0 * torch.rand_like(projected_gravity) - 1.0)
-                * float(0.05)
-                * self.cfg.randomize,
-                mock_cmd,
-                # self.cmd_vel,
-                joint_pos_rel
-                + (2.0 * torch.rand_like(joint_pos_rel) - 1.0)
-                * float(0.01)
-                * self.cfg.randomize,
-                joint_vel
-                + (2.0 * torch.rand_like(joint_vel) - 1.0)
-                * float(0.1)
-                * self.cfg.randomize,
+                self.proprio_delayed.clone(),
+                self.cmd_vel,
                 self.loc_actions,
             ],
             dim=-1,
         )
-
         self._update_odom_obs_history(odom_obs)
         odom_hist_flat = self.odom_obs_proprio_hist.reshape(self.num_envs, -1)
         return torch.cat([odom_hist_flat, self.pred_odom], dim=-1)
@@ -1012,10 +1024,10 @@ class Go2NavEnv(DirectRLEnv):
         # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))
 
         mock_cmd = torch.tensor(
-            [0.0, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype
+            [0.3, 0.0, 0.0], device=self.device, dtype=base_ang_vel.dtype
         ).repeat(self.num_envs, 1)
 
-        proprio_loc = torch.cat(
+        proprio_delayed = torch.cat(
             [
                 base_ang_vel
                 + (2.0 * torch.rand_like(base_ang_vel) - 1.0)
@@ -1025,8 +1037,6 @@ class Go2NavEnv(DirectRLEnv):
                 + (2.0 * torch.rand_like(projected_gravity) - 1.0)
                 * float(0.05)
                 * self.cfg.randomize,
-                mock_cmd,
-                # self.cmd_vel,
                 joint_pos_rel
                 + (2.0 * torch.rand_like(joint_pos_rel) - 1.0)
                 * float(0.01)
@@ -1035,31 +1045,35 @@ class Go2NavEnv(DirectRLEnv):
                 + (2.0 * torch.rand_like(joint_vel) - 1.0)
                 * float(0.1)
                 * self.cfg.randomize,
-                self.loc_actions,
             ],
             dim=-1,
         )
+        
+        proprio_delayed = self._sanitize_tensor(proprio_delayed,"proprio_delayed", clamp_abs=50.0)
+        if self.cfg.delay:
+            proprio_delayed = self._proprio_delay_buffer.compute(proprio_delayed)
+        self.proprio_delayed = proprio_delayed
+        proprio_loc = torch.cat(
+            [
+                proprio_delayed, 
+                # mock_cmd,
+                self.cmd_vel,
+                self.loc_actions
+                ], dim=-1) 
         return self._sanitize_tensor(
             proprio_loc, "proprio_loc", clamp_abs=50.0
         ), self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         # actions = [vxd, vyd, wzd]
-        self.cmd_vel.copy_(actions[:, :3])
+        self.cmd_vel.copy_(actions)
         self.prev_cmd_vel.copy_(self.cmd_vel)
 
         # 1. Locomotion policy
-        # cmd_limits = torch.tensor(self.cfg.locomotion_cmd_limits, device=self.device, dtype=self.actions.dtype)
-
         proprio_obs_loc, height_data_loc = self._build_locomotion_observations()
-
         self.prev_loc_actions.copy_(self.loc_actions)
         self.loc_actions.copy_(
             self._query_locomotion_policy(proprio_obs_loc, height_data_loc)
-        )
-        self.low_level_joint_targets = (
-            self._robot.data.default_joint_pos
-            + self.cfg.locomotion_action_scale * self.loc_actions
         )
 
         # 2. Odom model
@@ -1076,35 +1090,40 @@ class Go2NavEnv(DirectRLEnv):
         pred_h, pred_c = self._train_map_step(map_obs)
         self.pred_map.copy_(pred_h)
         self.pred_map_confidence.copy_(pred_c)
-        self._update_predicted_position_history(self.pred_odom[:, :3])
+        
         self.tick_count_env += 1
 
 
 
     def _apply_action(self) -> None:
-        # self._robot.set_joint_position_target(self._robot.data.default_joint_pos)
-        self._robot.set_joint_position_target(self.low_level_joint_targets)
+        low_level_joint_targets = (
+            self._robot.data.default_joint_pos
+            + self.cfg.locomotion_action_scale * self.loc_actions
+        )
+        self._robot.set_joint_position_target(low_level_joint_targets)
 
     def _get_observations(self) -> dict:
+        
         height_data_teacher = self._compute_height_data_from_cloud(
             randomize=False, locomotion=False
-        )
-        height_data_student = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, locomotion=False
         )
         height_data_teacher = (
             height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
             .flip(dims=[1])
             .unsqueeze(1)
         )
-        height_data_student = (
-            height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
+        
+        height_data = self._compute_height_data_from_cloud(
+            randomize=self.cfg.randomize, locomotion=False
+        )
+        height_data = (
+            height_data.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
             .flip(dims=[1])
             .unsqueeze(1)
         )
-
-        # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        # print(height_data_teacher[self.vis_envs][0,20:,25:45])
+        
+        if self.cfg.delay:
+            self.nav_height_map = self._grid_delay_buffer.compute(self._sanitize_tensor(height_data, "nav_height_map", clamp_abs=100.0))
 
         goal_xy_s = self._get_goal_pos_s()
         goal_yaw_s = self._get_goal_yaw_s()
@@ -1114,13 +1133,16 @@ class Go2NavEnv(DirectRLEnv):
         pred_pos_hist_long_term = self.pred_pos_hist_long_term.reshape(
             self.num_envs, -1
         )
+        vel = self.pred_odom[:,3:6]
+        
         student_proprio = torch.cat(
             [
                 goal_xy_s,
                 goal_yaw_s,
                 pred_pos_hist_short_term,
                 pred_pos_hist_long_term,
-                self.prev_cmd_vel,
+                vel,
+                self.cmd_vel,
             ],
             dim=-1,
         )
@@ -1164,30 +1186,29 @@ class Go2NavEnv(DirectRLEnv):
         teacher_proprio = self._sanitize_tensor(
             teacher_proprio, "teacher_proprio", clamp_abs=100.0
         )
-        student_height_scan = self._sanitize_tensor(
-            height_data_teacher, "student_height_scan", clamp_abs=10.0
-        )
+       
         teacher_height_scan = self._sanitize_tensor(
-            height_data_student, "teacher_height_scan", clamp_abs=10.0
+            height_data_teacher, "teacher_height_scan", clamp_abs=10.0
         )
-        if self.cfg.delay:
-            teacher_proprio = self._proprio_delay_buffer.compute(teacher_proprio)
-            teacher_height_scan = self._grid_delay_buffer.compute(teacher_height_scan)
-            student_proprio = self._proprio_delay_buffer.compute(student_proprio)
-            student_height_scan = self._grid_delay_buffer.compute(student_height_scan)
+        
+        pred_map_conf = torch.cat([self.pred_map.clone().unsqueeze(1), self.pred_map_confidence.clone().unsqueeze(1)], dim=1)
+        true_map = self.true_map.clone().unsqueeze(1)
 
         return {
             "student_proprio": student_proprio,
-            "student_height_scan": student_height_scan,
+            "student_height_scan": self.nav_height_map.clone(),
+            "student_map": pred_map_conf,
             "teacher_proprio": teacher_proprio,
             "teacher_height_scan": teacher_height_scan,
+            "teacher_map": true_map
         }
 
     def log_infos(self):
-        self.env_markers.visualize(
-            translations=self._robot.data.root_pos_w[self.vis_envs].unsqueeze(0),
-            orientations=self._robot.data.root_quat_w[self.vis_envs].unsqueeze(0),
-        )
+        if self.cfg.vis:
+            self.env_markers.visualize(
+                translations=self._robot.data.root_pos_w[self.vis_envs].unsqueeze(0),
+                orientations=self._robot.data.root_quat_w[self.vis_envs].unsqueeze(0),
+            )
         # terrain_coords: torch.Tensor = env_ids_to_terrain_coords(
         #     torch.tensor([self.vis_envs], device=self.device), self._terrain
         # )
@@ -1212,76 +1233,58 @@ class Go2NavEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         if self.cfg.vis:
             self.log_infos()
-
+            
+            
+        # Path distance reward:
+        # distance of the shortest path from the robot to the goal
         root_pos_w = self._robot.data.root_pos_w
-        goal_delta_xy = self.goal_pos_w[:, :2] - root_pos_w[:, :2]
-        goal_distance = torch.linalg.norm(goal_delta_xy, dim=-1)
         path_distance = self._compute_maze_path_distance(root_pos_w)
-        robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
-        yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
-
-        # --- goal distance (unchanged) ---
         rew_goal_distance = torch.exp(
             -path_distance / max(1e-4, float(self.cfg.goal_distance_sigma))
         )
 
-        # --- goal orientation: smooth gate instead of hard cutoff at 0.3 m ---
-        # was: torch.where(goal_distance < 0.3, exp(...), 0.0)  <- discontinuous, encourages
-        # boundary-hovering. Replaced with a smooth weight that fades in as the robot
-        # approaches, controlled by cfg.goal_orientation_gate_sigma (new field).
-        orientation_gate = torch.exp(
-            -goal_distance / max(1e-4, float(self.cfg.goal_orientation_gate_sigma))
-        )
-        rew_goal_orientation = orientation_gate * torch.exp(
-            -torch.square(yaw_error) / max(1e-4, float(self.cfg.goal_orientation_sigma))
-        )
+        # Yaw orientation penalty
+        # Only when the robot is close to the goal. The closer it is, the higher is the penalty
+        robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
+        yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
+        pen_goal_orientation = torch.where(path_distance < 0.1, 
+                                           (0.1 - path_distance) * -torch.square(yaw_error) / float(self.cfg.goal_orientation_sigma),
+                                           0.0)
+        
 
-        # --- goal progress: clamp against reset-induced spikes ---
-        # If prev_goal_distance wasn't correctly reset to the *new* episode's goal_distance
-        # on env reset, a stale value causes a one-step teleport spike here. Clamp as
-        # insurance regardless; ALSO verify _reset_idx() sets self.prev_goal_distance
-        # from the fresh goal_distance before the first reward is computed.
+        # Robot progress to goal
         raw_progress = self.prev_path_distance - path_distance
         rew_goal_progress = torch.clamp(
             raw_progress, -self.cfg.goal_progress_clip, self.cfg.goal_progress_clip
         )
-        self.prev_goal_distance.copy_(goal_distance.detach())
         self.prev_path_distance.copy_(path_distance.detach())
 
-        pen_time_penalty = torch.ones_like(goal_distance)
+        # Time penalty 
+        pen_time_penalty = torch.ones_like(path_distance)
 
-        true_odom = self._get_true_odom_s()
-        odom_error = torch.mean(torch.square(self.pred_odom - true_odom), dim=-1)
-        rew_odom_prediction = torch.exp(
-            -odom_error / max(1e-4, float(self.cfg.odom_prediction_sigma))
-        )
-        # NOTE: still recommend moving this to a supervised aux loss on the prediction
-        # head instead of shaping it through PPO's reward, if pred_odom is produced
-        # by a differentiable submodule you control. Left as-is here since that's a
-        # training-loop change, not a reward-function change.
 
+        # Violent commands penalty: goal -> smoothen commands
         pen_cmd_rate = torch.sum(torch.square(self.cmd_vel - self.prev_cmd_vel), dim=-1)
 
+        # Commands bounds
+        # 1. High commands (higher than whan the locomotion policy has learned)
         cmd_bounds_high = torch.sum(
-            torch.where(self.cmd_vel >= 1.0, torch.abs(self.cmd_vel), 0.0), dim=-1
+            torch.where(torch.abs(self.cmd_vel) >= 1.0, torch.abs(self.cmd_vel), 0.0), dim=-1
         )
-        # Low-end penalty: gated off near the goal so it doesn't fight rew_goal_orientation,
-        # which needs small, precise commands right at the goal. Reuses orientation_gate.
-        low_cmd_penalty = torch.sum(
-            torch.where(
-                self.cmd_vel <= 0.2,
-                torch.exp(-torch.abs(self.cmd_vel) / self.cfg.cmd_vel_sigma),
+        # 2. Low commands (If the robot is close to the goal, low commands are allowed)
+        min_cmd = torch.min(self.cmd_vel, dim=-1).values
+        low_cmd_penalty = torch.where(
+                torch.logical_and(min_cmd <= 0.2, path_distance > 0.1),
+                torch.exp(-torch.abs(min_cmd) / self.cfg.cmd_vel_sigma),
                 0.0,
-            ),
-            dim=-1,
-        )
-        pen_cmd_bounds = cmd_bounds_high + (1.0 - orientation_gate) * low_cmd_penalty
-
+            )
+        # 3. Total
+        pen_cmd_bounds = cmd_bounds_high + low_cmd_penalty
+        
+        # Reward for reaching the goal
         rew_goal_bonus = self.goal_reached.float()
-        # Confirm episodes actually terminate/truncate when goal_reached fires elsewhere
-        # in the step loop — otherwise this can pay out indefinitely while lingering at goal.
-
-        # --- undesired contacts (unchanged; graded version noted below if you want it) ---
+        
+        # Undesired contacts penalty
         contact_forces = torch.norm(
             self._contact_sensor.data.net_forces_w_history[
                 :, :, self._undesired_contact_body_ids_sensor
@@ -1291,11 +1294,8 @@ class Go2NavEnv(DirectRLEnv):
         is_contact = torch.max(contact_forces, dim=1)[0] > 1.0
         pen_undesired_contacts = torch.sum(is_contact, dim=1)
 
-        # --- NEW: stagnation penalty ---
-        # Penalizes sustained lack of progress toward the goal (stuck against geometry,
-        # spinning in place, oscillating). Requires a persistent per-env counter buffer,
-        # e.g. self._stall_counter = torch.zeros(num_envs, device=self.device), created
-        # in __init__ and reset to 0 in _reset_idx().
+        # Stagnation penalty
+        # Pen if the robot doesnt make progress for longer than the allowed stagnation_window
         making_progress = raw_progress > self.cfg.stagnation_progress_eps
         self._stall_counter = torch.where(
             making_progress,
@@ -1308,17 +1308,14 @@ class Go2NavEnv(DirectRLEnv):
             "rew_goal_distance": self.cfg.rew_scale_goal_distance
             * rew_goal_distance
             * self.step_dt,
-            "rew_goal_orientation": self.cfg.rew_scale_goal_orientation
-            * rew_goal_orientation
+            "pen_goal_orientation": self.cfg.rew_scale_goal_orientation
+            * pen_goal_orientation
             * self.step_dt,
             "rew_goal_progress": self.cfg.rew_scale_goal_progress
             * rew_goal_progress
             * self.step_dt,
             "pen_goal_penalty": self.cfg.rew_scale_time_penalty
             * pen_time_penalty
-            * self.step_dt,
-            "rew_odom_pred": self.cfg.rew_scale_odom_prediction
-            * rew_odom_prediction
             * self.step_dt,
             "pen_cmd_rate": self.cfg.rew_scale_cmd_rate * pen_cmd_rate * self.step_dt,
             "pen_cmd_bounds": self.cfg.rew_scale_cmd_bounds
@@ -1336,7 +1333,7 @@ class Go2NavEnv(DirectRLEnv):
         }
 
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
-        reward = self._sanitize_tensor(reward, "reward", clamp_abs=100.0)
+        reward = self._sanitize_tensor(reward, "reward", clamp_abs=1000.0)
 
         for key, value in rewards.items():
             self._episode_sums[key] += value
@@ -1377,8 +1374,8 @@ class Go2NavEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        if env_ids is not None and len(env_ids) != self.num_envs and self.cfg.plot:
-            self._plot_map_s(env_ids_tensor, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
+        if env_ids is not None and len(env_ids) != self.num_envs and self.cfg.plot and self.cfg.vis:
+            self._plot_map_s(self.vis_envs, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
         self._robot.reset(env_ids)
         move_up = None
         move_down = None
@@ -1488,9 +1485,7 @@ class Go2NavEnv(DirectRLEnv):
             [self.start_pos_w[env_ids], self.start_quat_w[env_ids]], dim=-1
         )
 
-        self.prev_goal_distance[env_ids_tensor] = torch.linalg.norm(
-            self.goal_pos_w[env_ids_tensor, :2] - default_root_state[:, :2], dim=-1
-        )
+
         self.prev_path_distance[env_ids_tensor] = self._compute_maze_path_distance(
             self.start_pos_w
         )[env_ids_tensor]
@@ -1744,17 +1739,18 @@ class Go2NavEnv(DirectRLEnv):
         self.goal_quat_w[:, 1] = 0.0  # x
         self.goal_quat_w[:, 2] = 0.0  # y
         self.goal_quat_w[:, 3] = torch.sin(self.goal_yaw_w / 2)  # z
-
-        if type(self.vis_envs) == int:
-            self.goal_markers.visualize(
-                translations=self.goal_pos_w[self.vis_envs].unsqueeze(0),
-                orientations=self.goal_quat_w[self.vis_envs].unsqueeze(0),
-            )
-        else:
-            self.goal_markers.visualize(
-                translations=self.goal_pos_w[self.vis_envs],
-                orientations=self.goal_quat_w[self.vis_envs],
-            )
+        
+        if self.cfg.vis:
+            if type(self.vis_envs) == int:
+                self.goal_markers.visualize(
+                    translations=self.goal_pos_w[self.vis_envs].unsqueeze(0),
+                    orientations=self.goal_quat_w[self.vis_envs].unsqueeze(0),
+                )
+            else:
+                self.goal_markers.visualize(
+                    translations=self.goal_pos_w[self.vis_envs],
+                    orientations=self.goal_quat_w[self.vis_envs],
+                )
 
     def _update_starts(self, env_ids: torch.Tensor, center: bool = False) -> None:
         """Update start positions for the given envs.
@@ -1833,17 +1829,18 @@ class Go2NavEnv(DirectRLEnv):
         self.start_quat_w[:, 1] = 0.0  # x
         self.start_quat_w[:, 2] = 0.0  # y
         self.start_quat_w[:, 3] = torch.sin(self.start_yaw_w / 2)  # z
-
-        if type(self.vis_envs) == int:
-            self.start_markers.visualize(
-                translations=self.start_pos_w[self.vis_envs].unsqueeze(0),
-                orientations=self.start_quat_w[self.vis_envs].unsqueeze(0),
-            )
-        else:
-            self.start_markers.visualize(
-                translations=self.start_pos_w[self.vis_envs],
-                orientations=self.start_quat_w[self.vis_envs],
-            )
+        
+        if self.cfg.vis:
+            if type(self.vis_envs) == int:
+                self.start_markers.visualize(
+                    translations=self.start_pos_w[self.vis_envs].unsqueeze(0),
+                    orientations=self.start_quat_w[self.vis_envs].unsqueeze(0),
+                )
+            else:
+                self.start_markers.visualize(
+                    translations=self.start_pos_w[self.vis_envs],
+                    orientations=self.start_quat_w[self.vis_envs],
+                )
     
     def _plot_map_s(self, vis_envs: torch.Tensor, save_dir: str = None) -> None:
         """Save a heatmap image of the global heightfield, true_map (with

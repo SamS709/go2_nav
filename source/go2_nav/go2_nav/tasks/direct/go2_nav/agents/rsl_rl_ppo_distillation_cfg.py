@@ -98,8 +98,8 @@ class Go2NavDistillationRunnerCfg(RslRlDistillationRunnerCfg):
     load_checkpoint = "model_.*.pt"
 
     obs_groups = {
-        "student": ["student_proprio", "student_height_scan"],
-        "teacher": ["teacher_proprio", "teacher_height_scan"],
+        "student": ["student_proprio", "student_height_scan", "student_map"],
+        "teacher": ["teacher_proprio", "teacher_height_scan", "teacher_map"],
     }
 
     student = RslRlCNNRNNModelCfg(
@@ -110,14 +110,15 @@ class Go2NavDistillationRunnerCfg(RslRlDistillationRunnerCfg):
         cnn_cfg=RslRlCNNRNNModelCfg.CNNCfg(
             output_channels=[16, 32],
             kernel_size=[3, 3],
-            stride=[2, 2],
+            stride=[1, 1],
+            padding="zeros",
             activation="relu",
             max_pool=False,
-            global_pool="avg",
+            global_pool="None",
         ),
         rnn_type="gru",
         rnn_hidden_dim=128,
-        rnn_num_layers=2,
+        rnn_num_layers=1,
         distribution_cfg=RslRlCNNRNNModelCfg.GaussianDistributionCfg(init_std=0.1, std_type="log"),
     )
 
@@ -129,14 +130,15 @@ class Go2NavDistillationRunnerCfg(RslRlDistillationRunnerCfg):
         cnn_cfg=RslRlCNNRNNModelCfg.CNNCfg(
             output_channels=[16, 32],
             kernel_size=[3, 3],
-            stride=[2, 2],
+            stride=[1, 1],
+            padding="zeros",
             activation="relu",
             max_pool=False,
-            global_pool="avg",
+            global_pool="None",
         ),
         rnn_type="gru",
         rnn_hidden_dim=128,
-        rnn_num_layers=2,
+        rnn_num_layers=1,
         distribution_cfg=RslRlCNNRNNModelCfg.GaussianDistributionCfg(init_std=0.1, std_type="log"),
     )
 

@@ -23,8 +23,8 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "go2_nav_planner"
     # Asymmetric actor-critic: student observations for actor, privileged teacher observations for critic.
     obs_groups = {
-        "actor": ["student_proprio", "student_height_scan"],
-        "critic": ["teacher_proprio", "teacher_height_scan"],
+        "actor": ["student_proprio", "student_height_scan", "student_map"],
+        "critic": ["teacher_proprio", "teacher_height_scan", "teacher_map"],
     }
     actor = RslRlCNNRNNModelCfg(
         class_name=CNN_RNN_MODEL,
@@ -85,8 +85,8 @@ class PPORunnerSeqCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "go2_nav_planner"
     # Asymmetric actor-critic: student observations for actor, privileged teacher observations for critic.
     obs_groups = {
-        "actor": ["student_proprio", "student_height_scan"],
-        "critic": ["teacher_proprio", "teacher_height_scan"],
+        "actor": ["student_proprio", "student_height_scan", "student_map"],
+        "critic": ["teacher_proprio", "teacher_height_scan", "teacher_map"],
     }
     actor = RslRlCNNRNNModelCfg(
         class_name=CNN_RNN_SEQ_MODEL,

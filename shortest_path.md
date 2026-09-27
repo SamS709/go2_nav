@@ -82,6 +82,22 @@ The final lookup has this conceptual form:
 maze_path_distances[env, start_cell, goal_cell] = number of cell transitions
 ```
 
+The table stores cell hops, not meters or continuous path lengths:
+
+```text
+same cell                         -> 0
+adjacent reachable cells          -> 1
+route with n cell transitions     -> n
+```
+
+The corresponding maze-scale distance in meters is:
+
+```python
+distance_meters = cell_distance * cell_size
+```
+
+For example, with `cell_size = 3.0 m`, a route containing four cell transitions has a topological length of `4 * 3.0 = 12.0 m`. A wall-blocked neighboring pair is not a one-hop connection; BFS must find another route around the wall.
+
 ### `_compute_maze_distance_table`
 
 This is the topology solver. It runs a breadth-first search from every cell.
@@ -138,11 +154,11 @@ It computes:
 
 ```text
 path_distance = cell_distance * cell_size
-              + distance(robot, robot_cell_center)
+              - progress toward the next path cell
               + distance(goal, goal_cell_center)
 ```
 
-The cell-to-cell portion accounts for walls. The endpoint terms prevent the metric from jumping by a complete cell when the robot moves within a cell.
+The cell-to-cell portion accounts for walls. The robot's within-cell movement is projected along the next maze-corridor direction instead of being measured from the cell center. This avoids charging the robot for its perpendicular offset from the center when that offset does not increase the actual route length.
 
 If the two cells are disconnected, the function falls back to Euclidean distance. This is a defensive fallback for malformed or inconsistent terrain data; generated maze layouts should normally be connected.
 

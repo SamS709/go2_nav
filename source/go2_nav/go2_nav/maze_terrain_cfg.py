@@ -556,7 +556,6 @@ def maze_terrain(
             door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and row != 0 
             if Direction.N not in cell.open_walls and not dest_wall_cond:
                 if door_wall_cond:
-                    print("DOOR")
                     meshes.append(
                         _box_mesh_with_door(
                             (cell_w + wall_thickness, wall_thickness, wall_height),
@@ -584,7 +583,6 @@ def maze_terrain(
             door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and col != maze_cols - 1            
             if col == maze_cols - 1 and Direction.E not in cell.open_walls and not dest_wall_cond:
                 if door_wall_cond:
-                    print("DOOR")
                     meshes.append(
                         _box_mesh_with_door(
                             (wall_thickness, cell_h + wall_thickness, wall_height),
@@ -608,7 +606,6 @@ def maze_terrain(
             door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and row != maze_rows - 1           
             if row == maze_rows - 1 and Direction.S not in cell.open_walls and not dest_wall_cond:
                 if door_wall_cond:
-                    print("DOOR")
                     meshes.append(
                         _box_mesh_with_door(
                             (cell_w + wall_thickness, wall_thickness, wall_height),
@@ -632,7 +629,6 @@ def maze_terrain(
             door_wall_cond = _sample_float(rng, 0.0, (0.0, 1.0)) < p_wall_door and col != 0 
             if Direction.W not in cell.open_walls and not dest_wall_cond:
                 if door_wall_cond:
-                    print("DOOR")
                     meshes.append(
                         _box_mesh_with_door(
                             (wall_thickness, cell_h + wall_thickness, wall_height),

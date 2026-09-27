@@ -102,16 +102,19 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     sim_freq = 200
     policy_freq = sim_freq / 4
     sim_dt = 1 / sim_freq
-    episode_length_s = 30.0
+    episode_length_s = 10.0
     
-    delay: bool = False
-    delay_length: int = 4
+    delay: bool = True
+    delay_length: int = 2
     
     # Planner output: [cmd_x, cmd_y, cmd_z]
     action_space = 3
     nav_cell_size = 0.2
     nav_x_range = (-0.4, 3.0) # 17
     nav_y_range = (-3.0, 3.0) # 30
+    
+    planner_map_crop_width = 10 # meters: width of the crop of the ap fed to the planner
+    planner_map_crop_height = 10 # meters: height of the crop of the ap fed to the planner
     
     map_width = 50 # meters
     map_height = 50 # meters
@@ -174,7 +177,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     # n_cols for the maze is constant fixed to maze_height
     
     # y <=> cols & x <=> rows
-    vis = True
+    vis = False
     plot = True
 
     NUM_ROWS = 3
@@ -313,9 +316,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     require_locomotion_policy = True
     locomotion_observation_dim = 195
     locomotion_action_scale = 0.25
-    locomotion_cmd_limits = (1.5, 1.0, 1.5)
-    
-      
+    locomotion_cmd_limits = (1.0, 1.0, 1.0)
 
     # goal and reward settings
     rew_scale_goal_distance = 1.0 # in ]0, 1]
