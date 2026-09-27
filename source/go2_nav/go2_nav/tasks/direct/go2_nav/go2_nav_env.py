@@ -127,20 +127,25 @@ class Go2NavEnv(DirectRLEnv):
                         device=self.device,
                     )
                 )
-            self._grid_delay_buffer: DelayBuffer = DelayBuffer(
+            self._loc_heightmap_delay_buffer: DelayBuffer = DelayBuffer(
+                history_length=self.cfg.delay_length,
+                batch_size=self.num_envs,
+                device=self.device,
+            )
+            self._nav_heightmap_delay_buffer: DelayBuffer = DelayBuffer(
                 history_length=self.cfg.delay_length,
                 batch_size=self.num_envs,
                 device=self.device,
             )
             if self.cfg.delay_length > 0:
-                self._grid_delay_buffer.set_time_lag(
-                    torch.randint(
-                        low=0,
-                        high=self.cfg.delay_length,
-                        size=(self.num_envs,),
-                        device=self.device,
-                    )
-                )
+                height_maps_time_lag = torch.randint(
+                                        low=0,
+                                        high=self.cfg.delay_length,
+                                        size=(self.num_envs,),
+                                        device=self.device,
+                                    )
+                self._loc_heightmap_delay_buffer.set_time_lag(height_maps_time_lag)
+                self._nav_heightmap_delay_buffer.set_time_lag(height_maps_time_lag)
 
         self._init_goals_and_starts()
 
@@ -1011,6 +1016,9 @@ class Go2NavEnv(DirectRLEnv):
             .flip(dims=[1])
             .unsqueeze(1)
         )
+        
+        height_data = self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
+        height_data = self._loc_heightmap_delay_buffer.compute(height_data)
 
         # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
         # print(height_data[self.vis_envs])
@@ -1062,7 +1070,7 @@ class Go2NavEnv(DirectRLEnv):
                 ], dim=-1) 
         return self._sanitize_tensor(
             proprio_loc, "proprio_loc", clamp_abs=50.0
-        ), self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
+        ), height_data
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         # actions = [vxd, vyd, wzd]
@@ -1123,7 +1131,7 @@ class Go2NavEnv(DirectRLEnv):
         )
         
         if self.cfg.delay:
-            self.nav_height_map = self._grid_delay_buffer.compute(self._sanitize_tensor(height_data, "nav_height_map", clamp_abs=100.0))
+            self.nav_height_map = self._nav_heightmap_delay_buffer.compute(self._sanitize_tensor(height_data, "nav_height_map", clamp_abs=100.0))
 
         goal_xy_s = self._get_goal_pos_s()
         goal_yaw_s = self._get_goal_yaw_s()
@@ -1471,15 +1479,17 @@ class Go2NavEnv(DirectRLEnv):
                     device=self.device,
                 )
             )
-            self._grid_delay_buffer.reset(env_ids_tensor.tolist())
-            self._grid_delay_buffer.set_time_lag(
-                torch.randint(
-                    low=0,
-                    high=self.cfg.delay_length,
-                    size=(self.num_envs,),
-                    device=self.device,
-                )
-            )
+            # delay heightmaps from the same time (bc the lisar is the same)
+            self._nav_heightmap_delay_buffer.reset(env_ids_tensor.tolist())
+            self._loc_heightmap_delay_buffer.reset(env_ids_tensor.tolist())
+            height_maps_time_lag = torch.randint(
+                                low=0,
+                                high=self.cfg.delay_length,
+                                size=(self.num_envs,),
+                                device=self.device,
+                            )
+            self._nav_heightmap_delay_buffer.set_time_lag(height_maps_time_lag)
+            self._loc_heightmap_delay_buffer.set_time_lag(height_maps_time_lag)
 
         root_state = torch.cat(
             [self.start_pos_w[env_ids], self.start_quat_w[env_ids]], dim=-1
