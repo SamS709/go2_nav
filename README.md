@@ -1,33 +1,32 @@
 # Go2 Navigation with Reinforcement Learning
 
-This project trains a navigation planner for the Unitree Go2 in Isaac Lab. The planner observes a local height scan, the goal, and histories of predicted positions, then produces three command values:
+This project trains a navigation planner for the Unitree Go2 in Isaac Lab. The planner outputs three velocity commands:
 
 ```text
-[cmd_x, cmd_y, cmd_z]
+[cmd_x, cmd_y, cmd_z] = [vx, vy, wz]
 ```
 
-These three values are used as the robot velocity command `[vx, vy, wz]`. The planner is separated from locomotion: a pretrained low-level policy converts proprioception and a local height scan into joint targets.
+The navigation planner is separated from low-level gait control. A pretrained locomotion policy receives the current robot state, the planner command, and a local height map, then produces joint actions for the Go2.
 
 ## System Overview
 
-At every environment step, the stack is wired as follows:
-
 ```text
 Go2 simulation
-    |-- proprioception + local height scan --> locomotion_policy --> 12 joint actions
-    |                                              |
-    |                                              +--> joint position targets
+    |-- proprioception + cmd_vel + local height map
+    |       --> locomotion_policy --> joint actions --> joint targets
     |
-    |-- proprioception history + previous odometry --> odom_model --> predicted odometry
-    |                                                                  |
-    |                                                                  +--> position histories
+    |-- proprioception history + cmd_vel + previous odometry
+    |       --> odom_model --> predicted odometry
+    |                              |
+    |                              +--> short/long position histories
     |
-    |-- navigation height scan + predicted odometry --> map_model --> predicted global map
+    |-- navigation height map + predicted odometry
+    |       --> map_model --> predicted height map + confidence map
     |
-    +-- goal + position histories + navigation scan --> RL planner --> [cmd_x, cmd_y, cmd_z]
+    +-- planner observations --> RL planner --> [vx, vy, wz]
 ```
 
-The planner action space is `3`, configured in `Go2NavEnvCfg`, with the layout `[cmd_x, cmd_y, cmd_z]`. The environment copies all three action values into `cmd_vel`.
+The planner uses a student/teacher observation setup. The actor or student sees onboard-style observations and the predicted map. The critic or teacher additionally receives privileged simulator information, including true odometry, maze information, and the true map.
 
 ## Installation
 
@@ -37,7 +36,7 @@ Install Isaac Lab first, then install this extension into the same Python enviro
 python -m pip install -e source/go2_nav
 ```
 
-The default locomotion checkpoint is `policies/policy_cnn_rnn_seq3.pt`. Run commands with the Isaac Lab Python launcher when Isaac Lab is not the active interpreter.
+The default locomotion checkpoint is `policies/policy_cnn_rnn_seq3.pt`. Use the Isaac Lab Python launcher when Isaac Lab is not the active interpreter.
 
 List the registered task:
 
@@ -49,25 +48,23 @@ The registered task is `Template-Go2-Nav-Direct-v0`.
 
 ## Training Flow
 
-The environment is a vectorized Isaac Lab `DirectRLEnv` with a default scene size of 4096 environments. Each policy step runs the following sequence:
+Each policy step runs this sequence:
 
-1. The RL planner receives the student observations and samples a 3-dimensional action, `[cmd_x, cmd_y, cmd_z]`.
-2. The three action values become `cmd_vel`, interpreted as `[vx, vy, wz]`.
-3. The locomotion model receives current proprioception and a local height map. Its command field is currently a zero placeholder rather than the planner's `cmd_vel`. Its joint action is scaled by `0.25` and added to the Go2 default joint pose.
-4. The odometry model receives a rolling proprioception history plus its previous 12-value prediction. It is trained against simulator ground truth and updates the predicted odometry.
-5. The predicted position is inserted into short-term and long-term histories.
-6. The map model receives the navigation height scan and predicted odometry. It is trained online against the simulator height map and updates the predicted map and confidence map.
-7. The simulator advances with the resulting joint targets. Rewards and termination are then computed.
-
-The reward combines goal distance, progress, goal orientation, time, odometry prediction quality, command smoothness and bounds, undesired contacts, a goal bonus, and stagnation penalties. Episodes terminate on goal completion or a base contact, and truncate at the episode time limit.
+1. The planner receives its observation groups and outputs the three-dimensional action `[vx, vy, wz]`.
+2. The environment copies this action directly into `cmd_vel`.
+3. The locomotion policy receives delayed proprioception, the current `cmd_vel`, the previous locomotion action, and a delayed local height map. It outputs joint actions that are scaled by `0.25` and added to the default Go2 joint pose.
+4. The odometry model receives a history of delayed proprioception, current `cmd_vel`, locomotion actions, and its previous odometry prediction. It is trained online against simulator odometry.
+5. The predicted odometry updates the short-term and long-term position histories.
+6. The map model receives the delayed navigation height map and predicted odometry. It predicts both a global height map and a confidence map.
+7. The planner receives the updated observations. The simulator advances with the low-level joint targets and computes rewards and termination conditions.
 
 ### Planner training modes
 
-The repository provides three RSL-RL configurations:
+The repository provides:
 
-- **Teacher pretraining:** PPO trains a recurrent CNN policy with privileged observations, including true odometry, goal-relative information, and maze features.
-- **Distillation:** a student with only navigation observations is trained from the privileged teacher.
-- **Direct PPO:** `PPORunnerCfg` trains the planner with asymmetric observations: the actor receives student observations while the critic receives privileged teacher observations.
+- **Teacher pretraining:** PPO trains a recurrent CNN policy using privileged observations.
+- **Distillation:** a student is trained from the privileged teacher.
+- **Direct PPO:** the actor uses student observations while the critic uses privileged teacher observations.
 
 Example commands:
 
@@ -85,26 +82,103 @@ python scripts/rsl_rl/train.py \
   --agent rsl_rl_cfg_entry_point
 ```
 
-The teacher and planner use a CNN plus GRU with two GRU layers of width 128. The CNN has convolutional layers with 16 and 32 channels, stride 2, ReLU activations, and global average pooling. PPO uses the settings in `source/go2_nav/go2_nav/tasks/direct/go2_nav/agents/rsl_rl_ppo_cfg.py`.
+The planner configurations use CNN-plus-GRU models. The CNN uses convolutional layers with 16 and 32 channels, stride 2, ReLU activations, and global average pooling. The recurrent hidden size is 128 with two GRU layers.
+
+## Planner Observations
+
+The planner observation groups are defined in `rsl_rl_ppo_cfg.py`.
+
+### Student/actor observations
+
+The student receives:
+
+- `student_proprio`: concatenation of:
+  - Goal XY position in the spawn frame: 2 values.
+  - Goal yaw: 1 value.
+  - Short-term predicted position history: `50 x 3` values.
+  - Long-term predicted position history: `50 x 3` values.
+  - Predicted roll, pitch, and yaw velocity/state slice from odometry: 3 values.
+  - Current planner command `cmd_vel`: 3 values.
+- `student_height_scan`: the delayed navigation height scan, currently one channel with shape `[1, 17, 30]` from the `0.2 m` navigation grid.
+- `student_map`: two map channels:
+  - Channel 0: predicted global height map.
+  - Channel 1: predicted map confidence.
+
+The predicted map is produced by the online map model. Confidence is therefore available to the planner instead of being discarded after map prediction.
+
+### Teacher/critic observations
+
+The teacher receives:
+
+- `teacher_proprio`: student proprioception plus privileged terms:
+  - True odometry in the spawn frame: position, roll/pitch/yaw, linear velocity, and angular velocity.
+  - Goal displacement in world coordinates.
+  - Goal heading encoded as sine and cosine.
+  - Maze terrain features and wall information.
+- `teacher_height_scan`: the non-randomized navigation height scan.
+- `teacher_map`: the simulator-derived true global map, provided as one height channel.
+
+The teacher observation is used by the critic or distillation teacher and is not intended to represent deployable sensor input.
+
+## Delay Buffers
+
+When `delay = True`, the environment uses three delay buffers:
+
+1. **`_proprio_delay_buffer`** delays proprioceptive state groups. It affects the proprioceptive input used by the locomotion and odometry paths.
+2. **`_loc_heightmap_delay_buffer`** delays the local height map sent to `locomotion_policy`.
+3. **`_nav_heightmap_delay_buffer`** delays the navigation height map sent to the planner and map path.
+
+The local and navigation height maps come from the same height sensor, so the environment samples one shared time-lag tensor and applies the same delay to both height-map buffers. This keeps the two views temporally consistent.
+
+The delay buffers are reset for the environments that reset, and their time lags are resampled at reset.
+
+## Reward Terms
+
+The planner reward is strongly shaped by maze-aware shortest-path distance. The environment converts the robot and goal world positions into maze cells, then queries a wall-aware BFS distance table. The table stores cell-hop counts:
+
+```text
+same cell                 -> 0 hops
+adjacent reachable cells  -> 1 hop
+n cell transitions       -> n hops
+```
+
+The hop count is converted to meters using `cell_size`. The current path metric also uses progress along the next reachable corridor instead of forcing the robot to pass through the center of its current cell. If robot and goal are in the same cell, direct Euclidean distance is used.
+
+The reward contains these terms:
+
+- **`rew_goal_distance`**: exponential reward based on the maze-aware remaining path distance. This is the main navigation-shaping term.
+- **`rew_goal_progress`**: rewards the reduction in maze path distance since the previous step, clipped by `goal_progress_clip`.
+- **`pen_goal_orientation`**: penalizes yaw error only when the robot is very close to the goal, using the configured path-distance threshold.
+- **`pen_goal_penalty`**: constant time penalty applied every step.
+- **`rew_goal_bonus`**: large bonus when the goal position and yaw termination condition is reached.
+- **`pen_cmd_rate`**: penalizes changes in `cmd_vel` to encourage smooth commands.
+- **`pen_cmd_bounds`**: penalizes commands outside the locomotion command range and very small commands while the robot is still far from the goal.
+- **`pen_undesired_contacts`**: penalizes contacts involving undesired robot bodies such as the base, hips, and thighs.
+- **`pen_stagnation`**: penalizes the robot after it has failed to make sufficient maze-path progress for the configured stagnation window.
+
+The reward is evaluated in every vectorized environment. Because the distance and progress terms use the maze shortest path, Euclidean distance alone does not encourage the robot to move toward walls or dead ends that look close but require a longer route.
+
+Episodes terminate when the goal is reached or the robot has an invalid base contact, and truncate at the episode time limit.
 
 ## External Models
 
-Only the locomotion policy is loaded as a pretrained TorchScript artifact. The odometry and map models are instantiated and optimized online by the environment.
-
 ### `locomotion_policy`
 
-**Role:** convert proprioception and a local height scan into low-level joint actions. The current environment leaves the command input at zero.
-
-**Structure:** the environment calls the exported recurrent CNN/RNN interface with one 1-D tensor and one 2-D tensor. The configured artifact is `policy_cnn_rnn_seq3.pt`; its runtime hidden state has shape `[1, num_envs, 128]`. The model is evaluated without gradients and its hidden state is reset for environments that reset.
+**Role:** convert the planner command and robot state into low-level joint actions.
 
 **Observations:**
 
-- A 45-value proprioception vector: base angular velocity (3), projected gravity (3), a zero command placeholder (3), relative joint positions (12), joint velocities (12), and the previous locomotion action (12).
-- A local height scan with shape `[1, 13, 10]`, generated from the `0.1 m` local grid covering `x = [-0.5, 0.8]` and `y = [-0.5, 0.5]`.
+- Base angular velocity.
+- Projected gravity.
+- Current `cmd_vel = [vx, vy, wz]`.
+- Relative joint positions.
+- Joint velocities.
+- Previous locomotion action.
+- Delayed local height map.
 
-**Loss:** none in this repository. The checkpoint is frozen and queried under inference mode. Its original locomotion-training loss is outside this project.
+The planner command is now actually passed into this model through the proprioceptive observation. The checkpoint is frozen and evaluated without gradients.
 
-**Output:** a 12-value joint action. The environment computes:
+**Output:** a 12-value joint action. The environment applies:
 
 ```text
 joint_target = default_joint_position + 0.25 * locomotion_action
@@ -112,22 +186,19 @@ joint_target = default_joint_position + 0.25 * locomotion_action
 
 ### `odom_model`
 
-**Role:** estimate the robot state in the episode spawn frame without using simulator ground truth as a planner input.
+**Role:** estimate robot state in the episode spawn frame without exposing simulator ground truth to the planner.
 
-**Structure:** a recurrent `RNNModel` with observation normalization, a one-layer GRU with hidden size 64, and an MLP with hidden layers `(128, 128)`. It is reset per environment episode and its recurrent state is detached after each online optimization step.
+**Structure:** observation normalization, a one-layer GRU with hidden size 64, and an MLP with hidden layers `(128, 128)`.
 
-**Observations:** one flattened 462-value vector:
+**Input:** ten frames of delayed proprioception history, current command and locomotion action information, plus the previous 12-value odometry prediction.
 
-- Ten frames of 45-value proprioception history, where each frame contains base angular velocity, projected gravity, a zero command placeholder, relative joint position, joint velocity, and the previous locomotion action.
-- The previous 12-value odometry prediction.
-
-**Target and loss:** simulator ground truth in the spawn frame, ordered as:
+**Target:**
 
 ```text
 [x, y, z, roll, pitch, yaw, vx, vy, vz, wx, wy, wz]
 ```
 
-The online loss is:
+**Loss:**
 
 ```text
 loss = MSE(position) + MSE(orientation)
@@ -135,27 +206,23 @@ loss = MSE(position) + MSE(orientation)
      + 0.5 * MSE(angular_velocity)
 ```
 
-Gradients are clipped to norm 1.0 before the Adam update.
-
-**Output:** a 12-value predicted odometry vector with the same ordering as the target. Its position component feeds the planner's short-term and long-term position histories, and the full vector is also used by the map model and odometry reward.
-
 ### `map_model`
 
-**Role:** build a global height map from partial local height observations and predicted odometry.
+**Role:** infer a global height map from partial navigation height observations and predicted odometry.
 
-**Structure:** `CNNRNNSeqModel` with:
+**Structure:** `CNNRNNSeqModel` with a two-layer CNN, odometry features, a one-layer GRU with hidden size 64, and an MLP head with hidden layers `(128, 64)`.
 
-- A 2-D CNN over the navigation height scan: convolution channels `[16, 32]`, kernel size `3`, stride `2`, ReLU activations, and global average pooling.
-- A 12-value odometry branch.
-- Fusion of the CNN latent and odometry branch before a one-layer GRU with hidden size 64.
-- An MLP head with hidden layers `(128, 64)`.
+**Input:**
 
-**Observations:**
+- Delayed navigation height map from the shared height sensor.
+- Current predicted 12-value odometry.
 
-- `height_data`: a one-channel navigation scan of shape `[1, 17, 30]`, using `0.2 m` cells over the configured navigation ranges.
-- `odom_data`: the current 12-value predicted odometry vector.
+**Output:** two flattened map predictions:
 
-**Target and loss:** the target is the simulator's global height map. `map_revealed` marks cells within the robot's lidar reveal radius. The output is split into a height prediction and confidence logits. The loss is:
+- Height prediction for every global map cell.
+- Confidence logit for every global map cell.
+
+The map loss is:
 
 ```text
 height_loss = masked SmoothL1(height_prediction, true_map)
@@ -163,19 +230,13 @@ confidence_loss = BCEWithLogits(confidence_logits, map_revealed)
 loss = height_loss + 0.5 * confidence_loss
 ```
 
-Height regression is applied only to revealed cells. Confidence classification is applied to every cell because the revealed/not-revealed label is known globally in simulation. Gradients are clipped to norm 1.0 before the Adam update.
-
-**Output:** `2 * 250 * 250` values for the configured `50 m x 50 m` map at `0.2 m` resolution:
-
-- `250 * 250` predicted heights.
-- `250 * 250` confidence logits, converted to probabilities with a sigmoid.
+Height regression is applied only to revealed cells. Confidence classification is applied everywhere because the simulator knows which cells have been revealed.
 
 ## Repository Layout
 
-- `source/go2_nav/go2_nav/tasks/direct/go2_nav/go2_nav_env.py`: simulation loop, model wiring, online auxiliary training, rewards, and resets.
-- `source/go2_nav/go2_nav/tasks/direct/go2_nav/go2_nav_env_cfg.py`: robot, terrain, sensor, action, observation, and checkpoint configuration.
+- `source/go2_nav/go2_nav/tasks/direct/go2_nav/go2_nav_env.py`: simulation loop, observations, delay buffers, model wiring, rewards, resets, and map plotting.
+- `source/go2_nav/go2_nav/tasks/direct/go2_nav/go2_nav_env_cfg.py`: robot, terrain, sensor, action, observation, delay, and reward configuration.
 - `source/go2_nav/go2_nav/tasks/direct/go2_nav/networks/`: custom CNN/RNN model implementations.
 - `source/go2_nav/go2_nav/tasks/direct/go2_nav/agents/`: PPO, teacher, and distillation configurations.
 - `scripts/rsl_rl/train.py`: Isaac Lab and RSL-RL training entry point.
-- `policies/`: TorchScript locomotion checkpoints used by the environment.
-- `logs/`: training outputs and checkpoints.
+- `policies/`: TorchScript locomotion checkpoints.
