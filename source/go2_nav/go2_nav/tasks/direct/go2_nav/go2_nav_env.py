@@ -27,7 +27,7 @@ from isaaclab.terrains import TerrainImporterCfg, TerrainImporter
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
-from .networks.cnn_rnn_model import CNNRNNSeqModel
+from .networks.cnn_rnn_model import CNNRNNSeqModel, CNNConvGRUMapModel
 from rsl_rl.models.rnn_model import RNNModel
 
 
@@ -332,24 +332,29 @@ class Go2NavEnv(DirectRLEnv):
     #################################################################
 
     def _load_map_model(self):
-        obs = TensorDict(
-            {
-                "height_data": torch.randn(
-                    self.num_envs, 1, self.nav_x_cells, self.nav_y_cells
-                ),  # 2D: B, C, H, W
-                "odom_data": torch.randn(self.num_envs, 12),  # 1D: B, D
-            }
+        map_cell = self.cfg.map_cell_size
+        map_h = int(self.cfg.map_width / map_cell)   # cells along x (dim i)
+        map_w = int(self.cfg.map_height / map_cell)  # cells along y (dim j)
+
+        # Spawn-frame xy of the corner of map cell [0, 0].
+        # Default assumes the map is centered on the spawn point: adapt if yours is not.
+        map_origin = getattr(
+            self.cfg, "map_origin", (-0.5 * self.cfg.map_width, -0.5 * self.cfg.map_height)
         )
 
-        # 2. Define groups exactly as they appear in obs
-        obs_groups = {
-            "policy": [
-                "height_data",
-                "odom_data",
-            ]  # Order matters for indexing if needed
-        }
+        # 1. Dummy observations used to infer shapes
+        obs = TensorDict(
+            {
+                "height_data": torch.randn(self.num_envs, 1, self.nav_x_cells, self.nav_y_cells),  # 2D: B, C, H, W
+                "odom_data": torch.randn(self.num_envs, 12),  # 1D: B, D
+            },
+            batch_size=[self.num_envs],
+        )
 
-        # 3. Define CNN config for the 'height_map' group
+        # 2. Observation groups
+        obs_groups = {"policy": ["height_data", "odom_data"]}
+
+        # 3. CNN config for the height scan
         cnn_cfg = {
             "height_data": {
                 "output_channels": [16, 32],
@@ -357,37 +362,53 @@ class Go2NavEnv(DirectRLEnv):
                 "stride": [2, 2],
                 "activation": "relu",
                 "max_pool": False,
-                "global_pool": "avg",
+                "global_pool": "none",   # keep spatial layout
+                "flatten": True,         # 32 * 3 * 6 = 576 latent
             }
         }
-        
+
         # 4. Initialize the model
-        model = CNNRNNSeqModel(
+        model = CNNConvGRUMapModel(
             obs=obs,
             obs_groups=obs_groups,
-            activation="identity",
-            obs_normalization=True,
             obs_set="policy",
-            output_dim=2 * int(self.cfg.map_width / self.cfg.map_cell_size) * int(self.cfg.map_height / self.cfg.map_cell_size),
-            hidden_dims=(128, 64),
+            output_dim=2 * map_h * map_w,
+            hidden_dims=(128, 128),        # fusion MLP (scan latent + odom -> FiLM conditioning)
+            activation="elu",              # not "identity": the conv nets need a nonlinearity
+            obs_normalization=True,
             cnn_cfg=cnn_cfg,
-            rnn_hidden_dim=64,
-            rnn_num_layers=1,
             rnn_type="gru",
+            rnn_hidden_dim=32,             # ConvGRU hidden channels
+            rnn_num_layers=1,
+            map_shape=(map_h, map_w),
+            map_resolution=map_cell,
+            map_origin=map_origin,
+            state_stride=2,                # ConvGRU at half resolution, bilinear upsampling in the decoder
+            input_channels=32,
+            decoder_channels=32,
+            odom_indices=(0, 1, 5),        # x, y, yaw in [x, y, z, roll, pitch, yaw, ...]
         )
         model = model.to(self.device)
         model.eval()
-        model.reset()
-        # 5. Test: forward pass
+
+        # 5. Test forward pass
         with torch.no_grad():
             obs_dict = TensorDict(
-                {"height_data": obs["height_data"].to(self.device), "odom_data": obs["odom_data"].to(self.device)},
-                batch_size=obs["odom_data"].shape[:1],
+                {
+                    "height_data": obs["height_data"].to(self.device),
+                    "odom_data": obs["odom_data"].to(self.device),
+                },
+                batch_size=[self.num_envs],
                 device=self.device,
             )
-            model(obs_dict)
+            out = model(obs_dict)
+            assert out.shape == (self.num_envs, 2 * map_h * map_w), out.shape
+
+        # The test pass filled the hidden state with dummy data: clear it.
+        model.reset()
+
         print("Map model")
-        print(model)  
+        print(model)
         return model
     
 
