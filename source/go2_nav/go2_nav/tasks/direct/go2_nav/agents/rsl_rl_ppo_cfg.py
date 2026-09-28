@@ -11,7 +11,7 @@ from go2_nav.tasks.direct.go2_nav.networks.cnn_rnn_cfg import RslRlCNNRNNModelCf
 from go2_nav.tasks.direct.go2_nav.networks.cnn3d_cfg import RslRlCNN3DModelCfg
 
 CNN_RNN_MODEL = "go2_nav.tasks.direct.go2_nav.networks.cnn_rnn_model:CNNRNNModel"
-CNN_RNN_SEQ_MODEL = "go2_nav.tasks.direct.go2_nav.networks.cnn_rnn_model:CNNRNNSeqModel"
+CNN_RNN_NEW_MODEL = "go2_nav.tasks.direct.go2_nav.networks.cnn_rnn_model:CNNRNNSeqModel"
 CNN3D_MODEL = "go2_nav.tasks.direct.go2_nav.networks.cnn3d_model:CNN3DModel"
 
 
@@ -89,7 +89,7 @@ class PPORunnerSeqCfg(RslRlOnPolicyRunnerCfg):
         "critic": ["teacher_proprio", "teacher_height_scan", "teacher_map"],
     }
     actor = RslRlCNNRNNModelCfg(
-        class_name=CNN_RNN_SEQ_MODEL,
+        class_name=CNN_RNN_NEW_MODEL,
         hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=True,
@@ -107,7 +107,7 @@ class PPORunnerSeqCfg(RslRlOnPolicyRunnerCfg):
         distribution_cfg=RslRlCNNRNNModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
     )
     critic = RslRlCNNRNNModelCfg(
-        class_name=CNN_RNN_SEQ_MODEL,
+        class_name=CNN_RNN_NEW_MODEL,
         hidden_dims=[512, 256, 128],
         activation="elu",
         obs_normalization=True,

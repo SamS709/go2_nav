@@ -143,7 +143,7 @@ Gradients are clipped to norm 1.0 before the Adam update.
 
 **Role:** build a global height map from partial local height observations and predicted odometry.
 
-**Structure:** `CNNRNNNewModel` with:
+**Structure:** `CNNRNNSeqModel` with:
 
 - A 2-D CNN over the navigation height scan: convolution channels `[16, 32]`, kernel size `3`, stride `2`, ReLU activations, and global average pooling.
 - A 12-value odometry branch.

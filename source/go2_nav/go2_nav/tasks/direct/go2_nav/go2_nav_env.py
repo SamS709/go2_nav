@@ -27,7 +27,7 @@ from isaaclab.terrains import TerrainImporterCfg, TerrainImporter
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
-from .networks.cnn_rnn_model import CNNRNNNewModel
+from .networks.cnn_rnn_model import CNNRNNSeqModel
 from rsl_rl.models.rnn_model import RNNModel
 
 
@@ -362,7 +362,7 @@ class Go2NavEnv(DirectRLEnv):
         }
         
         # 4. Initialize the model
-        model = CNNRNNNewModel(
+        model = CNNRNNSeqModel(
             obs=obs,
             obs_groups=obs_groups,
             activation="identity",
@@ -946,7 +946,6 @@ class Go2NavEnv(DirectRLEnv):
             return pred_odom.detach()
 
     def _build_odom_observations(self) -> torch.Tensor:
-        base_ang_vel = self._robot.data.root_ang_vel_b
 
 
         # odom obs shape = 3 + 3 + 3 + 12 + 12 + 12 = 45
