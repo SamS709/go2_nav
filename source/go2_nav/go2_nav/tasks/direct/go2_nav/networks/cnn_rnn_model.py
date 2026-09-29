@@ -732,7 +732,7 @@ class SpatialMemoryRNN(nn.Module):
         num_layers: int,
         fusion_dims: tuple[int, ...] | list[int],
         activation: str,
-        odom_indices: tuple[int, int, int],
+        odom_indices: tuple[int, int, int, int],  # (x, y, sin_yaw, cos_yaw)
         coord_scale: float | None,
     ) -> None:
         super().__init__()
@@ -741,14 +741,13 @@ class SpatialMemoryRNN(nn.Module):
         self.state_w = math.ceil(width / state_stride)
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
-        self.x_idx, self.y_idx, self.yaw_idx = odom_indices
+        self.x_idx, self.y_idx, self.sin_idx, self.cos_idx = odom_indices
         self.coord_scale = coord_scale if coord_scale is not None else 0.5 * max(height, width) * map_resolution
 
-        # Fusion of 1D latent + CNN latent + sin/cos(yaw) -> conditioning vector.
-        self.fusion = _make_mlp(obs_dim_1d + cnn_latent_dim + 2, fusion_dims, activation)
+        # Fusion of 1D latent + CNN latent -> conditioning vector. sin/cos already live in latent_1d.
+        self.fusion = _make_mlp(obs_dim_1d + cnn_latent_dim, fusion_dims, activation)
         self.film = nn.Linear(fusion_dims[-1], 2 * input_channels)
 
-        # Convs on robot-relative coordinates (dx, dy, r).
         self.coord_net = nn.Sequential(
             nn.Conv2d(3, input_channels, 3, padding=1),
             _ACTIVATIONS[activation](),
@@ -761,17 +760,14 @@ class SpatialMemoryRNN(nn.Module):
             cells.append(ConvGRUCell(input_channels if i == 0 else hidden_channels, hidden_channels))
         self.cells = nn.ModuleList(cells)
 
-        # World coordinates of state-cell centers. Convention: map[i, j] -> i along x, j along y.
         ox, oy = map_origin
         ci = (torch.arange(self.state_h) * state_stride + (state_stride - 1) / 2.0 + 0.5) * map_resolution + ox
         cj = (torch.arange(self.state_w) * state_stride + (state_stride - 1) / 2.0 + 0.5) * map_resolution + oy
         self.register_buffer("grid_x", ci.view(1, -1, 1).expand(1, self.state_h, self.state_w).clone(), persistent=False)
         self.register_buffer("grid_y", cj.view(1, 1, -1).expand(1, self.state_h, self.state_w).clone(), persistent=False)
 
-        # Online hidden state (inference / rollout mode). Not a buffer, so it is never saved.
         self.hidden_state: torch.Tensor | None = None
 
-    # ---------------------------------------------------------------- core step (also used by exporters)
     def forward_step(
         self,
         latent_1d: torch.Tensor,
@@ -779,18 +775,18 @@ class SpatialMemoryRNN(nn.Module):
         raw_1d: torch.Tensor,
         hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # x, y stay raw (metric), needed for the geometric coordinate transform below.
         x = raw_1d[..., self.x_idx]
         y = raw_1d[..., self.y_idx]
-        yaw = raw_1d[..., self.yaw_idx]
 
-        cond_in = torch.cat([latent_1d, latent_cnn, torch.sin(yaw).unsqueeze(-1), torch.cos(yaw).unsqueeze(-1)], dim=-1)
+        cond_in = torch.cat([latent_1d, latent_cnn], dim=-1)
         f = self.fusion(cond_in)
         gamma, beta = self.film(f).chunk(2, dim=-1)
 
         dx = (self.grid_x - x.view(-1, 1, 1)) / self.coord_scale
         dy = (self.grid_y - y.view(-1, 1, 1)) / self.coord_scale
         r = torch.sqrt(dx * dx + dy * dy + 1e-6)
-        coords = torch.stack([dx, dy, r], dim=1)  # (B, 3, h, w)
+        coords = torch.stack([dx, dy, r], dim=1)
 
         g = self.coord_net(coords)
         out = self.act(g * (1.0 + gamma.unsqueeze(-1).unsqueeze(-1)) + beta.unsqueeze(-1).unsqueeze(-1))
@@ -894,7 +890,7 @@ class CNNConvGRUMapModel(MLPModel):
         state_stride: int = 1,  # >1 runs the ConvGRU at a coarser resolution to save memory
         input_channels: int = 32,
         decoder_channels: int = 32,
-        odom_indices: tuple[int, int, int] = (0, 1, 5),  # x, y, yaw in the 1D obs
+        odom_indices: tuple[int, int, int, int] = (0, 1, 5, 6),  # x, y, sin_yaw, cos_yaw in the 1D obs
         coord_scale: float | None = None,
     ) -> None:
         if rnn_type != "gru":

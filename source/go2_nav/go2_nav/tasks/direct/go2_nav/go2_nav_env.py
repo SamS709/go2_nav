@@ -345,8 +345,8 @@ class Go2NavEnv(DirectRLEnv):
         # 1. Dummy observations used to infer shapes
         obs = TensorDict(
             {
-                "height_data": torch.randn(self.num_envs, 1, self.nav_x_cells, self.nav_y_cells),  # 2D: B, C, H, W
-                "odom_data": torch.randn(self.num_envs, 12),  # 1D: B, D
+                "height_data": torch.randn(self.num_envs, 1, self.nav_x_cells, self.nav_y_cells),
+                "odom_data": torch.randn(self.num_envs, 13),  # x, y, z, roll, pitch, sin_yaw, cos_yaw, vx, vy, vz, wx, wy, wz
             },
             batch_size=[self.num_envs],
         )
@@ -386,7 +386,7 @@ class Go2NavEnv(DirectRLEnv):
             state_stride=2,                # ConvGRU at half resolution, bilinear upsampling in the decoder
             input_channels=32,
             decoder_channels=32,
-            odom_indices=(0, 1, 5),        # x, y, yaw in [x, y, z, roll, pitch, yaw, ...]
+            odom_indices = (0, 1, 5, 6),  # x, y, sin_yaw, cos_yaw in the 1D obs
         )
         model = model.to(self.device)
         model.eval()
@@ -414,21 +414,20 @@ class Go2NavEnv(DirectRLEnv):
 
     def _build_map_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
 
-        
-        # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
-        # print(height_data[self.vis_envs])
-
-        # cell_size_m = float(self.cfg.loc_cell_size)
-        # inv_cell_size = 1.0 / cell_size_m
-        # x_min, x_max = float(self.cfg.loc_x_range[0]), float(self.cfg.loc_x_range[1])
-        # y_min, y_max = float(self.cfg.loc_y_range[0]), float(self.cfg.loc_y_range[1])
-        # print(height_data_student.reshape(int((x_max - x_min)*inv_cell_size),int((y_max - y_min)*inv_cell_size)))
-
-        # print(height_data.reshape(self.num_envs, 15, 10).flip(1,2))
-
         pred_odom = self.pred_odom.clone()
+        yaw = pred_odom[..., 5]
+        obs_map_odom = torch.cat(
+            [
+                pred_odom[..., 0:5],                # x, y, z, roll, pitch
+                torch.sin(yaw).unsqueeze(-1),
+                torch.cos(yaw).unsqueeze(-1),
+                pred_odom[..., 6:12],                # vx, vy, vz, wx, wy, wz
+            ],
+            dim=-1,
+        )  # 13 values
+        
         return self._sanitize_tensor(
-            pred_odom, "obs_map_odom", clamp_abs=1000.0
+            obs_map_odom, "obs_map_odom", clamp_abs=1000.0
         ), self.nav_height_map.clone()
         
     def _update_true_map(self, env_ids: torch.Tensor) -> None:
