@@ -242,7 +242,8 @@ class Go2NavEnv(DirectRLEnv):
             self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
             self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
             self.env_markers = VisualizationMarkers(self.cfg.env_marker_cfg)
-            self.vis_envs = 6
+        if self.cfg.vis or self.cfg.plot:
+            self.vis_envs: torch.Tensor = torch.tensor([6])
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -345,7 +346,7 @@ class Go2NavEnv(DirectRLEnv):
         # 1. Dummy observations used to infer shapes
         obs = TensorDict(
             {
-                "height_data": torch.randn(self.num_envs, 1, self.nav_x_cells, self.nav_y_cells),
+                "height_data": torch.randn(self.num_envs, 2, self.nav_x_cells, self.nav_y_cells),
                 "odom_data": torch.randn(self.num_envs, 13),  # x, y, z, roll, pitch, sin_yaw, cos_yaw, vx, vy, vz, wx, wy, wz
             },
             batch_size=[self.num_envs],
@@ -373,20 +374,22 @@ class Go2NavEnv(DirectRLEnv):
             obs_groups=obs_groups,
             obs_set="policy",
             output_dim=2 * map_h * map_w,
-            hidden_dims=(128, 128),        # fusion MLP (scan latent + odom -> FiLM conditioning)
-            activation="elu",              # not "identity": the conv nets need a nonlinearity
+            hidden_dims=(64, 64),
+            activation="elu",
             obs_normalization=True,
-            cnn_cfg=cnn_cfg,
             rnn_type="gru",
-            rnn_hidden_dim=32,             # ConvGRU hidden channels
+            rnn_hidden_dim=32,
             rnn_num_layers=1,
             map_shape=(map_h, map_w),
             map_resolution=map_cell,
             map_origin=map_origin,
-            state_stride=2,                # ConvGRU at half resolution, bilinear upsampling in the decoder
+            state_stride=2,
+            scan_resolution=1/self.nav_inv_cell_size,          # must match the nav height scanner's actual grid resolution
+            scan_yaw_aligned=True,        # set False if your RayCaster grid is world/spawn-axis-aligned
+            scan_feat_channels=16,
             input_channels=32,
             decoder_channels=32,
-            odom_indices = (0, 1, 5, 6),  # x, y, sin_yaw, cos_yaw in the 1D obs
+            odom_indices=(0, 1, 5, 6),
         )
         model = model.to(self.device)
         model.eval()
@@ -1027,17 +1030,19 @@ class Go2NavEnv(DirectRLEnv):
         joint_vel = self._robot.data.joint_vel
 
         # height_data = self._compute_height_data_from_cloud(randomize=self.cfg.randomize)
-        height_data = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, locomotion=True
+        height_data, valid = self._compute_height_data_from_cloud(
+            randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize, locomotion=True
         )
         height_data = (
             height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells)
             .flip(dims=[1])
-            .unsqueeze(1)
         )
-        
         height_data = self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
-        height_data = self._loc_heightmap_delay_buffer.compute(height_data)
+        valid = valid.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).float()
+        
+        grid = torch.stack([height_data, valid], dim=1)
+        
+        grid = self._loc_heightmap_delay_buffer.compute(grid)
 
         # torch.set_printoptions(precision=2, linewidth=1000, sci_mode=False)
         # print(height_data[self.vis_envs])
@@ -1087,9 +1092,10 @@ class Go2NavEnv(DirectRLEnv):
                 self.cmd_vel,
                 self.loc_actions
                 ], dim=-1) 
+        
         return self._sanitize_tensor(
             proprio_loc, "proprio_loc", clamp_abs=50.0
-        ), height_data
+        ), grid
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         # actions = [vxd, vyd, wzd]
@@ -1131,26 +1137,39 @@ class Go2NavEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         
-        height_data_teacher = self._compute_height_data_from_cloud(
-            randomize=False, locomotion=False
+        height_data_teacher, valid_teacher = self._compute_height_data_from_cloud(
+            randomize=False, apply_dropout=False,locomotion=False
         )
         height_data_teacher = (
             height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
             .flip(dims=[1])
-            .unsqueeze(1)
+        )
+        height_data_teacher = self._sanitize_tensor(height_data_teacher, "height_data_loc", clamp_abs=10.0)
+        valid_teacher = (
+            valid_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
+            .flip(dims=[1])
         )
         
-        height_data = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, locomotion=False
+        height_data_teacher = torch.stack([height_data_teacher, valid_teacher], dim=1)
+        
+        height_data_student, valid_student = self._compute_height_data_from_cloud(
+            randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize, locomotion=False
         )
-        height_data = (
-            height_data.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
+        
+        height_data_student = (
+            height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
             .flip(dims=[1])
-            .unsqueeze(1)
         )
+        height_data_student = self._sanitize_tensor(height_data_student, "height_data_loc", clamp_abs=10.0)
+        valid_student = (
+            valid_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
+            .flip(dims=[1])
+        )
+        
+        height_data_student = torch.stack([height_data_student, valid_student], dim=1)
         
         if self.cfg.delay:
-            self.nav_height_map = self._nav_heightmap_delay_buffer.compute(self._sanitize_tensor(height_data, "nav_height_map", clamp_abs=100.0))
+            self.nav_height_map = self._nav_heightmap_delay_buffer.compute(height_data_student)
 
         goal_xy_s = self._get_goal_pos_s()
         goal_yaw_s = self._get_goal_yaw_s()
@@ -1214,9 +1233,6 @@ class Go2NavEnv(DirectRLEnv):
             teacher_proprio, "teacher_proprio", clamp_abs=100.0
         )
        
-        teacher_height_scan = self._sanitize_tensor(
-            height_data_teacher, "teacher_height_scan", clamp_abs=10.0
-        )
         
         pred_map_conf = torch.cat([self.pred_map.clone().unsqueeze(1), self.pred_map_confidence.clone().unsqueeze(1)], dim=1)
         true_map = self.true_map.clone().unsqueeze(1)
@@ -1226,7 +1242,7 @@ class Go2NavEnv(DirectRLEnv):
             "student_height_scan": self.nav_height_map.clone(),
             "student_map": pred_map_conf,
             "teacher_proprio": teacher_proprio,
-            "teacher_height_scan": teacher_height_scan,
+            "teacher_height_scan": height_data_teacher,
             "teacher_map": true_map
         }
 
@@ -1401,8 +1417,13 @@ class Go2NavEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        if env_ids is not None and len(env_ids) != self.num_envs and self.cfg.plot and self.cfg.vis:
-            self._plot_map_s(self.vis_envs, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
+        if env_ids is not None and len(env_ids) != self.num_envs and self.cfg.plot:
+            plot = False
+            for env_id in env_ids:
+                if env_id in self.vis_envs.tolist():
+                    plot = True
+            if plot:
+                self._plot_map_s(self.vis_envs, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
         self._robot.reset(env_ids)
         move_up = None
         move_down = None
@@ -1571,46 +1592,24 @@ class Go2NavEnv(DirectRLEnv):
         rotated_z = y_coord * sin_angles + z_coord * cos_angles
         return torch.stack((x_coord, rotated_y, rotated_z), dim=-1)
 
-    def _zero_heightmap_cells(self, height_map):
-        self.same_zeros_count += 1
-        if self.same_zeros_count == self.reset_zeros_freq:
-            self.reset_zeros_freq = int(
-                torch.randint(
-                    1, self.cfg.max_reset_zeros_freq + 1, (1,), device=self.device
-                ).item()
-            )
-            self.same_zeros_count = 0
-            self.sampled_indices = torch.multinomial(
-                self.gaussian_prob_heightmap, self.cfg.n_zeros, replacement=True
-            )
-        height_map_actor = height_map.clone()
-        height_map_actor[:, self.sampled_indices] = 0.0
-        return height_map_actor
-
-    def _compute_height_data_from_cloud(
-        self, randomize: bool = False, locomotion: bool = True
-    ):
+    def _compute_height_data_from_cloud(self, randomize: bool = False, apply_dropout: bool = True, locomotion: bool = True):
         """Compute flattened heightmap in lidar frame using cfg x/y bounds and cell size."""
-        # choose the desired output whether this is the loc or nav lidar
-
         data = self._height_scanner.data
         ray_hits_w = data.ray_hits_w
         lidar_pos_w = data.pos_w
         lidar_quat_w = data.quat_w
         num_envs, num_rays, _ = ray_hits_w.shape
-        rays_rel_w = -ray_hits_w + lidar_pos_w.unsqueeze(1)
+        rays_rel_w = - ray_hits_w + lidar_pos_w.unsqueeze(1)
         rays_lidar = quat_apply(
-            quat_conjugate(lidar_quat_w)
-            .unsqueeze(1)
-            .expand(num_envs, num_rays, 4)
-            .reshape(-1, 4),
+            quat_conjugate(lidar_quat_w).unsqueeze(1).expand(num_envs, num_rays, 4).reshape(-1, 4),
             rays_rel_w.reshape(-1, 3),
         ).reshape(num_envs, num_rays, 3)
         # rays_lidar = rays_rel_w
         if randomize and hasattr(self, "_rots"):
             rays_lidar = self._apply_yaw_rotation(rays_lidar)
             rays_lidar = self._apply_roll_rotation(rays_lidar)
-
+            
+            
         if locomotion:
             x_cells = self.loc_x_cells
             y_cells = self.loc_y_cells
@@ -1627,12 +1626,7 @@ class Go2NavEnv(DirectRLEnv):
             num_cells = self.nav_num_cells
 
         rays_flat = rays_lidar.reshape(-1, 3)
-        env_ids = (
-            torch.arange(num_envs, device=self.device)
-            .unsqueeze(1)
-            .expand(num_envs, num_rays)
-            .reshape(-1)
-        )
+        env_ids = torch.arange(num_envs, device=self.device).unsqueeze(1).expand(num_envs, num_rays).reshape(-1)
 
         valid = torch.isfinite(rays_flat).all(dim=1)
         if not torch.any(valid):
@@ -1655,22 +1649,124 @@ class Go2NavEnv(DirectRLEnv):
         # Flatten env and cell indexing into one reduce op.
         flat_idx = env_ids * num_cells + x_idx * y_cells + y_idx
         height_map = torch.full((num_envs * num_cells,), -torch.inf, device=self.device)
-        height_map.scatter_reduce_(
-            0, flat_idx, z_vals, reduce="amax", include_self=True
-        )
-        height_map += self.cfg.desired_base_height_loc
-        height_map = torch.where(
-            torch.isfinite(height_map), -height_map, torch.zeros_like(height_map)
-        )
-
-        height_map = height_map.reshape(num_envs, num_cells)
+        height_map.scatter_reduce_(0, flat_idx, z_vals, reduce="amax", include_self=True)
+        height_map = height_map.reshape(num_envs, num_cells) + self.cfg.desired_base_height
+        hit_mask = torch.isfinite(height_map)                       # capture BEFORE the where() destroys it
+        height_map = torch.where(hit_mask, -height_map, torch.zeros_like(height_map))
         if randomize:
             height_map = self._apply_offset(height_map)
             height_map += (2.0 * torch.rand_like(height_map) - 1.0) * float(0.01)
-            height_map = self._zero_heightmap_cells(height_map)
+        if apply_dropout:
+            height_map, dropout_mask = self._zero_heightmap_cells(height_map)
+            valid = hit_mask & dropout_mask
+        else:
+            valid = hit_mask
+        return height_map, valid
+    
 
-        # Keep ordering consistent with lidar_debug flow.
-        return height_map
+    def _apply_offset(self, height_map):
+        if not hasattr(self, "_offsets"):
+            return height_map
+        offset_shape = (self._offsets.shape[0],) + (1,) * (height_map.ndim - 1)
+        return height_map + self._offsets.view(offset_shape)
+    
+    def _zero_heightmap_cells(self, height_map):
+        self.same_zeros_count += 1
+        if self.same_zeros_count == self.reset_zeros_freq:
+            self.reset_zeros_freq = int(torch.randint(1, self.cfg.max_reset_zeros_freq + 1, (1,), device=self.device).item())
+            self.same_zeros_count = 0
+            self.sampled_indices = torch.multinomial(self.gaussian_prob_heightmap, self.cfg.n_zeros, replacement=True)
+        height_map_actor = height_map.clone()
+        valid = torch.ones_like(height_map, dtype=torch.bool)
+        height_map_actor[:, self.sampled_indices] = 0.0
+        valid[:, self.sampled_indices] = False
+        return height_map_actor, valid
+
+
+    # def _compute_height_data_from_cloud(
+    #     self, randomize: bool = False, locomotion: bool = True
+    # ):
+    #     """Compute flattened heightmap in lidar frame using cfg x/y bounds and cell size."""
+    #     # choose the desired output whether this is the loc or nav lidar
+
+    #     data = self._height_scanner.data
+    #     ray_hits_w = data.ray_hits_w
+    #     lidar_pos_w = data.pos_w
+    #     lidar_quat_w = data.quat_w
+    #     num_envs, num_rays, _ = ray_hits_w.shape
+    #     rays_rel_w = -ray_hits_w + lidar_pos_w.unsqueeze(1)
+    #     rays_lidar = quat_apply(
+    #         quat_conjugate(lidar_quat_w)
+    #         .unsqueeze(1)
+    #         .expand(num_envs, num_rays, 4)
+    #         .reshape(-1, 4),
+    #         rays_rel_w.reshape(-1, 3),
+    #     ).reshape(num_envs, num_rays, 3)
+    #     # rays_lidar = rays_rel_w
+    #     if randomize:
+    #         rays_lidar = self._apply_yaw_rotation(rays_lidar)
+    #         rays_lidar = self._apply_roll_rotation(rays_lidar)
+
+    #     if locomotion:
+    #         x_cells = self.loc_x_cells
+    #         y_cells = self.loc_y_cells
+    #         inv_cell_size = self.loc_inv_cell_size
+    #         x_min = float(self.cfg.loc_x_range[0])
+    #         y_min = float(self.cfg.loc_y_range[0])
+    #         num_cells = self.loc_num_cells
+    #     else:
+    #         x_cells = self.nav_x_cells
+    #         y_cells = self.nav_y_cells
+    #         inv_cell_size = self.nav_inv_cell_size
+    #         x_min = float(self.cfg.nav_x_range[0])
+    #         y_min = float(self.cfg.nav_y_range[0])
+    #         num_cells = self.nav_num_cells
+
+    #     rays_flat = rays_lidar.reshape(-1, 3)
+    #     env_ids = (
+    #         torch.arange(num_envs, device=self.device)
+    #         .unsqueeze(1)
+    #         .expand(num_envs, num_rays)
+    #         .reshape(-1)
+    #     )
+
+    #     valid = torch.isfinite(rays_flat).all(dim=1)
+    #     if not torch.any(valid):
+    #         return torch.zeros((num_envs, num_cells), device=self.device)
+
+    #     rays_valid = rays_flat[valid]
+    #     env_ids = env_ids[valid]
+
+    #     x_idx = torch.floor((rays_valid[:, 0] - x_min) * inv_cell_size).long()
+    #     y_idx = torch.floor((rays_valid[:, 1] - y_min) * inv_cell_size).long()
+    #     in_bounds = (x_idx >= 0) & (x_idx < x_cells) & (y_idx >= 0) & (y_idx < y_cells)
+    #     if not torch.any(in_bounds):
+    #         return torch.zeros((num_envs, num_cells), device=self.device)
+
+    #     x_idx = x_idx[in_bounds]
+    #     y_idx = y_idx[in_bounds]
+    #     env_ids = env_ids[in_bounds]
+    #     z_vals = rays_valid[in_bounds, 2]
+
+    #     # Flatten env and cell indexing into one reduce op.
+    #     flat_idx = env_ids * num_cells + x_idx * y_cells + y_idx
+    #     height_map = torch.full((num_envs * num_cells,), -torch.inf, device=self.device)
+    #     height_map.scatter_reduce_(
+    #         0, flat_idx, z_vals, reduce="amax", include_self=True
+    #     )
+    #     height_map += self.cfg.desired_base_height_loc
+    #     height_map = torch.where(
+    #         torch.isfinite(height_map), -height_map, torch.zeros_like(height_map)
+    #     )
+
+    #     height_map = height_map.reshape(num_envs, num_cells)
+    #     if randomize:
+    #         height_map = self._apply_offset(height_map)
+    #         height_map += (2.0 * torch.rand_like(height_map) - 1.0) * float(0.01)
+    #         height_map = self._zero_heightmap_cells(height_map)
+
+    #     # Keep ordering consistent with lidar_debug flow.
+    #     return height_map
 
     def _get_goal_pos_s(self) -> torch.Tensor:
         """Goal position in start frame (2D, x forward, y left)."""

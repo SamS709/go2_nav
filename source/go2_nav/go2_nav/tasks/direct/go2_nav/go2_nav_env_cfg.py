@@ -122,7 +122,7 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     map_lidar_radius = 2.5 # meters: the distance revealed around the robot 
     
     loc_cell_size = 0.1
-    loc_x_range = [-0.5, 0.8]
+    loc_x_range = [-0.3, 0.5]
     loc_y_range = [-0.5, 0.5]
     
     sigma = 4.00
@@ -312,11 +312,12 @@ class Go2NavEnvCfg(DirectRLEnvCfg):
     )
     
     # planner -> locomotion policy interface
-    locomotion_policy_path = "policies/policy_cnn_rnn_seq3.pt"
+    locomotion_policy_path = "policies/policy_cnn_rnn2.pt"
     require_locomotion_policy = True
     locomotion_observation_dim = 195
     locomotion_action_scale = 0.25
     locomotion_cmd_limits = (1.0, 1.0, 1.0)
+    desired_base_height = 0.28
 
     # goal and reward settings
     rew_scale_goal_distance = 1.0 # in ]0, 1]

@@ -689,9 +689,8 @@ def _make_mlp(in_dim: int, hidden_dims: tuple[int, ...] | list[int], activation:
         prev = h
     return nn.Sequential(*layers)
 
-
 class ConvGRUCell(nn.Module):
-    """GRU cell whose gates are convolutions, so the hidden state is a spatial map (C, h, w)."""
+    """GRU cell whose gates are convolutions; hidden state is a spatial map (C, h, w)."""
 
     def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3) -> None:
         super().__init__()
@@ -706,27 +705,37 @@ class ConvGRUCell(nn.Module):
 
 
 class SpatialMemoryRNN(nn.Module):
-    """Spatial recurrent core (plays the role of `RNN` in CNNRNNSeqModel).
+    """Spatial recurrent core.
 
     Per step:
-      1. Fuse [normalized odom/1D obs, CNN scan latent, sin/cos(yaw)] with an MLP -> vector f.
-      2. Build robot-relative coordinate channels (dx, dy, r) over the global grid from raw odometry x, y.
-      3. Pass them through a small conv net, modulated by f with FiLM (gamma, beta). This lets the
-         network learn *where* on the global map the current scan should be written.
-      4. Feed the result into a stack of ConvGRU cells whose hidden state has the map's spatial layout.
+      1. Encode the raw scan with a small, shape-preserving conv trunk (stride 1, same padding) so its
+         spatial layout AND its metric resolution stay known and unchanged.
+      2. Geometrically warp the encoded scan onto the global (state) grid with `grid_sample`, using the
+         robot's current (x, y, yaw): this is an explicit, non-learned placement, not something the
+         network has to infer. Cells the scan doesn't cover receive zero.
+      3. Concatenate the warped scan content with the (dx, dy, r) geometry field and run `coord_net`
+         on BOTH together, so content and geometry interact locally and spatially, not just through a
+         single global gate.
+      4. Feed the result into the ConvGRU.
 
-    Hidden state layout: (num_layers, B, hidden_channels, state_h, state_w).
-    Dim 1 is the env/batch dim, as with a standard torch GRU hidden state.
+    This replaces the earlier FiLM-only design, where the scan only modulated the geometry branch
+    globally (one gamma/beta per channel), which let the network collapse to a content-independent
+    radial function of (dx, dy, r) alone -- visible as concentric rings in the predicted map.
     """
 
     def __init__(
         self,
         obs_dim_1d: int,
-        cnn_latent_dim: int,
         map_shape: tuple[int, int],
         map_resolution: float,
         map_origin: tuple[float, float],
         state_stride: int,
+        scan_shape: tuple[int, int],
+        scan_resolution: float,
+        scan_channels: int,
+        scan_center: tuple[float, float] | None,
+        scan_yaw_aligned: bool,
+        scan_feat_channels: int,
         input_channels: int,
         hidden_channels: int,
         num_layers: int,
@@ -744,12 +753,35 @@ class SpatialMemoryRNN(nn.Module):
         self.x_idx, self.y_idx, self.sin_idx, self.cos_idx = odom_indices
         self.coord_scale = coord_scale if coord_scale is not None else 0.5 * max(height, width) * map_resolution
 
-        # Fusion of 1D latent + CNN latent -> conditioning vector. sin/cos already live in latent_1d.
-        self.fusion = _make_mlp(obs_dim_1d + cnn_latent_dim, fusion_dims, activation)
+        self.scan_h, self.scan_w = scan_shape
+        self.scan_resolution = scan_resolution
+        self.scan_yaw_aligned = scan_yaw_aligned
+        # Scan-grid index of the robot's own position within the local scan window.
+        # Default: geometric center. Override if the sensor window is offset (e.g. forward-facing).
+        sci, scj = scan_center if scan_center is not None else ((self.scan_h - 1) / 2.0, (self.scan_w - 1) / 2.0)
+        self.scan_center_i = sci
+        self.scan_center_j = scj
+
+        # Shape-preserving scan encoder: stride 1, same padding -> output stays (scan_h, scan_w),
+        # so the metric resolution (scan_resolution) used for the warp below stays exact.
+        self.scan_encoder = nn.Sequential(
+            nn.Conv2d(scan_channels, scan_feat_channels, 3, padding=1),
+            _ACTIVATIONS[activation](),
+            nn.Conv2d(scan_feat_channels, scan_feat_channels, 3, padding=1),
+        )
+
+        # Small conditioning MLP from odometry only, used for a light global FiLM on top of the
+        # (now content-aware) geometry branch -- kept only for extra context (e.g. velocity), not as
+        # the sole content path anymore.
+        self.fusion = nn.Sequential(
+            nn.Linear(obs_dim_1d, fusion_dims[0]), _ACTIVATIONS[activation](),
+            nn.Linear(fusion_dims[0], fusion_dims[-1]), _ACTIVATIONS[activation](),
+        )
         self.film = nn.Linear(fusion_dims[-1], 2 * input_channels)
 
+        # coord_net now takes geometry (3 ch) + warped scan content (scan_feat_channels).
         self.coord_net = nn.Sequential(
-            nn.Conv2d(3, input_channels, 3, padding=1),
+            nn.Conv2d(3 + scan_feat_channels, input_channels, 3, padding=1),
             _ACTIVATIONS[activation](),
             nn.Conv2d(input_channels, input_channels, 3, padding=1),
         )
@@ -760,6 +792,7 @@ class SpatialMemoryRNN(nn.Module):
             cells.append(ConvGRUCell(input_channels if i == 0 else hidden_channels, hidden_channels))
         self.cells = nn.ModuleList(cells)
 
+        # World coordinates of state-cell centers (fixed, precomputed once).
         ox, oy = map_origin
         ci = (torch.arange(self.state_h) * state_stride + (state_stride - 1) / 2.0 + 0.5) * map_resolution + ox
         cj = (torch.arange(self.state_w) * state_stride + (state_stride - 1) / 2.0 + 0.5) * map_resolution + oy
@@ -768,27 +801,65 @@ class SpatialMemoryRNN(nn.Module):
 
         self.hidden_state: torch.Tensor | None = None
 
+    # ---------------------------------------------------------------- geometric warp
+    def _warp_scan(self, scan_feat: torch.Tensor, x: torch.Tensor, y: torch.Tensor, sin_yaw: torch.Tensor, cos_yaw: torch.Tensor) -> torch.Tensor:
+        """Place scan_feat (B, C, scan_h, scan_w) onto the (state_h, state_w) grid via grid_sample.
+
+        For every output cell, computes its world offset from the robot, converts to the scan's local
+        frame (rotating by -yaw if the scan is yaw-aligned to the robot body), and samples scan_feat at
+        that location. Cells outside the scan's coverage sample as zero (padding_mode="zeros").
+        """
+        # World-frame offset of every state cell from the robot, in meters.
+        owx = self.grid_x - x.view(-1, 1, 1)  # (B, state_h, state_w)
+        owy = self.grid_y - y.view(-1, 1, 1)
+
+        if self.scan_yaw_aligned:
+            # Rotate world offset into the robot's body frame (inverse of the robot's world rotation).
+            local_x = owx * cos_yaw.view(-1, 1, 1) + owy * sin_yaw.view(-1, 1, 1)
+            local_y = -owx * sin_yaw.view(-1, 1, 1) + owy * cos_yaw.view(-1, 1, 1)
+        else:
+            local_x, local_y = owx, owy
+
+        # Convert metric body-frame offset to fractional scan-grid indices.
+        si = local_x / self.scan_resolution + self.scan_center_i
+        sj = local_y / self.scan_resolution + self.scan_center_j
+
+        # grid_sample expects normalized coords in [-1, 1], last dim = (x -> width/scan_w, y -> height/scan_h).
+        norm_x = 2.0 * sj / max(self.scan_w - 1, 1) - 1.0
+        norm_y = 2.0 * si / max(self.scan_h - 1, 1) - 1.0
+        grid = torch.stack([norm_x, norm_y], dim=-1)  # (B, state_h, state_w, 2)
+
+        warped = F.grid_sample(scan_feat, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        return warped  # (B, C, state_h, state_w)
+
+    # ---------------------------------------------------------------- core step
     def forward_step(
         self,
+        height_data: torch.Tensor,
         latent_1d: torch.Tensor,
-        latent_cnn: torch.Tensor,
         raw_1d: torch.Tensor,
         hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # x, y stay raw (metric), needed for the geometric coordinate transform below.
         x = raw_1d[..., self.x_idx]
         y = raw_1d[..., self.y_idx]
+        sin_yaw = raw_1d[..., self.sin_idx]
+        cos_yaw = raw_1d[..., self.cos_idx]
 
-        cond_in = torch.cat([latent_1d, latent_cnn], dim=-1)
-        f = self.fusion(cond_in)
-        gamma, beta = self.film(f).chunk(2, dim=-1)
+        scan_feat = self.scan_encoder(height_data)                      # (B, C, scan_h, scan_w)
+        warped = self._warp_scan(scan_feat, x, y, sin_yaw, cos_yaw)      # (B, C, state_h, state_w)
 
-        dx = (self.grid_x - x.view(-1, 1, 1)) / self.coord_scale
-        dy = (self.grid_y - y.view(-1, 1, 1)) / self.coord_scale
+        owx = self.grid_x - x.view(-1, 1, 1)
+        owy = self.grid_y - y.view(-1, 1, 1)
+        dx = owx / self.coord_scale
+        dy = owy / self.coord_scale
         r = torch.sqrt(dx * dx + dy * dy + 1e-6)
         coords = torch.stack([dx, dy, r], dim=1)
 
-        g = self.coord_net(coords)
+        coord_in = torch.cat([coords, warped], dim=1)
+        g = self.coord_net(coord_in)
+
+        f = self.fusion(latent_1d)
+        gamma, beta = self.film(f).chunk(2, dim=-1)
         out = self.act(g * (1.0 + gamma.unsqueeze(-1).unsqueeze(-1)) + beta.unsqueeze(-1).unsqueeze(-1))
 
         new_h: list[torch.Tensor] = []
@@ -823,26 +894,18 @@ class SpatialMemoryRNN(nn.Module):
 
 
 class MapDecoder(nn.Module):
-    """Convolutional decoder (plays the role of the MLP head).
-
-    (..., C, h, w) -> conv -> bilinear upsample to (H, W) -> conv -> 2 channels -> flatten.
-    Output layout is [height (H*W), confidence logit (H*W)], matching the flattened 2-channel map.
-    Handles any number of leading dims, i.e. both (B, C, h, w) and (T, B, C, h, w).
-    """
+    """Conv decoder: (..., C, h, w) -> upsample to (H, W) -> 2 output channels -> flatten."""
 
     def __init__(self, in_channels: int, map_shape: tuple[int, int], decoder_channels: int, activation: str) -> None:
         super().__init__()
         self.map_h, self.map_w = map_shape
         act = _ACTIVATIONS[activation]
         self.pre = nn.Sequential(
-            nn.Conv2d(in_channels, decoder_channels, 3, padding=1),
-            act(),
-            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
-            act(),
+            nn.Conv2d(in_channels, decoder_channels, 3, padding=1), act(),
+            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1), act(),
         )
         self.post = nn.Sequential(
-            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1),
-            act(),
+            nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1), act(),
             nn.Conv2d(decoder_channels, 2, 1),
         )
 
@@ -852,18 +915,13 @@ class MapDecoder(nn.Module):
         x = self.pre(x)
         if x.shape[-2] != self.map_h or x.shape[-1] != self.map_w:
             x = F.interpolate(x, size=[self.map_h, self.map_w], mode="bilinear", align_corners=False)
-        x = self.post(x)  # (N, 2, H, W)
+        x = self.post(x)
         return x.reshape(lead + [-1])
 
 
 class CNNConvGRUMapModel(MLPModel):
-    """Scan CNN + odometry FiLM conditioning + ConvGRU spatial memory + conv decoder.
-
-    Observation groups:
-      - 1D group(s): must contain the (predicted) odometry. `odom_indices` gives the indices of
-        (x, y, yaw) inside the concatenated raw 1D observation.
-      - 2D group(s): the delayed navigation height scan(s), shape (B, C, H, W).
-    Output: flattened [height, confidence_logit] map, `output_dim = 2 * map_H * map_W`.
+    """Content-aware ConvGRU map model: scan is warped onto the global frame geometrically, then
+    fused with (dx, dy, r) before the conv/ConvGRU stack, instead of only modulating it via FiLM.
     """
 
     is_recurrent: bool = True
@@ -874,86 +932,59 @@ class CNNConvGRUMapModel(MLPModel):
         obs_groups: dict[str, list[str]],
         obs_set: str,
         output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (128, 128),  # fusion MLP (scan latent + odom)
+        hidden_dims: tuple[int, ...] | list[int] = (64, 64),  # odom fusion MLP only now
         activation: str = "elu",
         obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
-        cnn_cfg: dict[str, dict] | dict[str, Any] | None = None,
-        cnns: nn.ModuleDict | dict[str, nn.Module] | None = None,
         rnn_type: str = "gru",
-        rnn_hidden_dim: int = 32,  # = number of ConvGRU hidden CHANNELS
+        rnn_hidden_dim: int = 32,
         rnn_num_layers: int = 1,
-        # ---- map-specific arguments ----
-        map_shape: tuple[int, int] = (40, 40),
+        map_shape: tuple[int, int] = (250, 250),
         map_resolution: float = 0.2,
-        map_origin: tuple[float, float] = (0.0, 0.0),  # world/spawn-frame xy of the corner of cell [0, 0]
-        state_stride: int = 1,  # >1 runs the ConvGRU at a coarser resolution to save memory
+        map_origin: tuple[float, float] | None = None,
+        state_stride: int = 2,
+        scan_resolution: float = 0.2,
+        scan_center: tuple[float, float] | None = None,
+        scan_yaw_aligned: bool = True,  # set False if the scan is world/spawn-axis-aligned, not robot-yaw-aligned
+        scan_feat_channels: int = 16,
         input_channels: int = 32,
         decoder_channels: int = 32,
-        odom_indices: tuple[int, int, int, int] = (0, 1, 5, 6),  # x, y, sin_yaw, cos_yaw in the 1D obs
+        odom_indices: tuple[int, int, int, int] = (0, 1, 5, 6),  # x, y, sin_yaw, cos_yaw
         coord_scale: float | None = None,
     ) -> None:
         if rnn_type != "gru":
             raise ValueError("CNNConvGRUMapModel only supports rnn_type='gru' (ConvGRU).")
-        if distribution_cfg is not None:
-            raise ValueError("The map model is a regression model; distribution_cfg must be None.")
         if output_dim != 2 * map_shape[0] * map_shape[1]:
             raise ValueError(f"output_dim must be 2 * H * W = {2 * map_shape[0] * map_shape[1]}, got {output_dim}.")
 
-        # Resolve observation groups and dimensions for CNN construction.
         self._get_obs_dim(obs, obs_groups, obs_set)
+        if len(self.obs_groups_2d) != 1:
+            raise ValueError("CNNConvGRUMapModel expects exactly one 2D observation group (the height scan).")
+        scan_group = self.obs_groups_2d[0]
+        scan_channels = self.obs_channels_2d[0]
+        scan_shape = tuple(self.obs_dims_2d[0])
+        self.scan_group = scan_group
 
-        # Create or validate CNN encoders.
-        if cnns is not None:
-            if set(cnns.keys()) != set(self.obs_groups_2d):
-                raise ValueError("The 2D observations must be identical for all models sharing CNN encoders.")
-            print("Sharing CNN encoders between models, the CNN configurations of the receiving model are ignored.")
-        else:
-            if cnn_cfg is None:
-                raise ValueError("CNN configurations must be provided if CNNs are not shared.")
-            if not all(isinstance(v, dict) for v in cnn_cfg.values()):
-                cnn_cfg = {group: cnn_cfg for group in self.obs_groups_2d}
-            if len(cnn_cfg) != len(self.obs_groups_2d):
-                raise ValueError("The number of CNN configurations must match the number of observation groups.")
-            cnns = {}
-            for idx, obs_group in enumerate(self.obs_groups_2d):
-                cnns[obs_group] = CNN(
-                    input_dim=self.obs_dims_2d[idx],
-                    input_channels=self.obs_channels_2d[idx],
-                    **cnn_cfg[obs_group],
-                )
-
-        # Compute latent dimension of the CNNs.
-        self.cnn_latent_dim = 0
-        for cnn in cnns.values():
-            if cnn.output_channels is not None:
-                raise ValueError("The output of the CNN must be flattened before passing it to the fusion MLP.")
-            self.cnn_latent_dim += int(cnn.output_dim)  # type: ignore
+        if map_origin is None:
+            map_origin = (-0.5 * map_shape[0] * map_resolution, -0.5 * map_shape[1] * map_resolution)
 
         self.rnn_hidden_dim = rnn_hidden_dim
         self.map_shape = tuple(map_shape)
 
-        # Initialize the parent MLP model (gives obs normalization + 1D group handling).
-        # output_dim=1 is a placeholder: the dense head is replaced by a conv decoder below.
-        super().__init__(
-            obs,
-            obs_groups,
-            obs_set,
-            1,
-            (8,),
-            activation,
-            obs_normalization,
-            None,
-        )
+        # output_dim=1 placeholder: the dense head is replaced by MapDecoder below.
+        super().__init__(obs, obs_groups, obs_set, 1, (8,), activation, obs_normalization, None)
 
-        # Spatial recurrent core (replaces RNN).
         self.rnn = SpatialMemoryRNN(
             obs_dim_1d=self.obs_dim,
-            cnn_latent_dim=self.cnn_latent_dim,
             map_shape=self.map_shape,
             map_resolution=map_resolution,
             map_origin=map_origin,
             state_stride=state_stride,
+            scan_shape=scan_shape,
+            scan_resolution=scan_resolution,
+            scan_channels=scan_channels,
+            scan_center=scan_center,
+            scan_yaw_aligned=scan_yaw_aligned,
+            scan_feat_channels=scan_feat_channels,
             input_channels=input_channels,
             hidden_channels=rnn_hidden_dim,
             num_layers=rnn_num_layers,
@@ -963,204 +994,67 @@ class CNNConvGRUMapModel(MLPModel):
             coord_scale=coord_scale,
         )
 
-        # Replace the dense head by the conv decoder.
         self.mlp = MapDecoder(rnn_hidden_dim, self.map_shape, decoder_channels, activation)
-
-        # Register CNN encoders.
-        if isinstance(cnns, nn.ModuleDict):
-            self.cnns = cnns
-        else:
-            self.cnns = nn.ModuleDict(cnns)
 
     def get_latent(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
-        """Encode scans, run the ConvGRU, and return the spatial latent (..., C, h, w) for the conv decoder."""
-        # Normalized 1D latent, (B, D) for inference or (T, B, D) for a padded training rollout.
         latent_1d = super().get_latent(obs)
-        # Raw 1D observation (un-normalized), needed for geometry (x, y, yaw).
-        # NOTE: assumes MLPModel stores the active 1D groups in `self.obs_groups`.
         raw_1d = torch.cat([obs[g] for g in self.obs_groups], dim=-1)
-
-        latent_cnn_list = []
-        
-        for obs_group in self.obs_groups_2d:
-            obs_2d = obs[obs_group]
-            if masks is not None:
-                # Keep the padded (T, B, ...) layout, as in CNNRNNSeqModel.
-                time_len, batch_len = obs_2d.shape[0], obs_2d.shape[1]
-                obs_2d_flat = obs_2d.reshape(time_len * batch_len, *obs_2d.shape[2:])
-                latent_cnn = self.cnns[obs_group](obs_2d_flat).reshape(time_len, batch_len, -1)
-            else:
-                latent_cnn = self.cnns[obs_group](obs_2d)
-            latent_cnn_list.append(latent_cnn)
-        latent_cnn = torch.cat(latent_cnn_list, dim=-1)
+        scan = obs[self.scan_group]
 
         if masks is not None:
-            # Batch (training) mode: unroll over time from the given initial hidden state.
             if hidden_state is None:
                 raise ValueError("A hidden state is required when masks are provided (batch mode).")
             h = hidden_state
             outs = []
             for t in range(latent_1d.shape[0]):
-                out, h = self.rnn.forward_step(latent_1d[t], latent_cnn[t], raw_1d[t], h)
+                out, h = self.rnn.forward_step(scan[t], latent_1d[t], raw_1d[t], h)
                 outs.append(out)
-            
             return unpad_trajectories(torch.stack(outs, dim=0), masks)
 
-        # Step (inference / rollout) mode: use the internal hidden state.
         batch = latent_1d.shape[0]
         hs = self.rnn.hidden_state
         if hs is None or hs.shape[1] != batch:
             hs = self.rnn.init_hidden(batch, latent_1d.device, latent_1d.dtype)
         elif hs.is_inference():
-            # State was created under torch.inference_mode(): make it a normal tensor so autograd can use it.
             hs = hs.clone()
-        out, new_hs = self.rnn.forward_step(latent_1d, latent_cnn, raw_1d, hs)
-        # Truncate BPTT at every call: keep the state but drop its graph.
+        out, new_hs = self.rnn.forward_step(scan, latent_1d, raw_1d, hs)
         self.rnn.hidden_state = new_hs.detach()
         return out
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
-        """Reset the ConvGRU hidden state (all envs, or only those flagged in `dones`)."""
         self.rnn.reset(dones, hidden_state)
 
     def get_hidden_state(self) -> HiddenState:
-        """Return the ConvGRU hidden state, shape (num_layers, B, C, h, w)."""
         return self.rnn.hidden_state  # type: ignore
 
     def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
-        """Detach the recurrent hidden state for truncated backpropagation."""
         self.rnn.detach_hidden_state(dones)
 
-    def as_jit(self) -> nn.Module:
-        """Return a version of the model compatible with Torch JIT export."""
-        return _TorchConvGRUMapModel(self)
-
-    def as_onnx(self, verbose: bool = False) -> nn.Module:
-        """Return a version of the model compatible with ONNX export."""
-        return _OnnxConvGRUMapModel(self, verbose)
-
     def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
-        """Select active observation groups and compute 1D observation dimension."""
         active_obs_groups = obs_groups[obs_set]
         obs_dim_1d = 0
         obs_groups_1d = []
         obs_dims_2d = []
         obs_channels_2d = []
         obs_groups_2d = []
-
         for obs_group in active_obs_groups:
-            if len(obs[obs_group].shape) == 4:  # B, C, H, W
+            if len(obs[obs_group].shape) == 4:
                 obs_groups_2d.append(obs_group)
                 obs_dims_2d.append(obs[obs_group].shape[2:4])
                 obs_channels_2d.append(obs[obs_group].shape[1])
-            elif len(obs[obs_group].shape) == 2:  # B, C
+            elif len(obs[obs_group].shape) == 2:
                 obs_groups_1d.append(obs_group)
                 obs_dim_1d += obs[obs_group].shape[-1]
             else:
                 raise ValueError(f"Invalid observation shape for {obs_group}: {obs[obs_group].shape}")
-
         if not obs_groups_2d:
-            raise ValueError("No 2D observations are provided. Use RNNModel if this is intentional.")
-
+            raise ValueError("No 2D observations are provided.")
         self.obs_dims_2d = obs_dims_2d
         self.obs_channels_2d = obs_channels_2d
         self.obs_groups_2d = obs_groups_2d
-
         return obs_groups_1d, obs_dim_1d
 
     def _get_latent_dim(self) -> int:
-        """Latent channels consumed by the decoder (only used by MLPModel to build its placeholder head)."""
         return self.rnn_hidden_dim
-
-
-class _TorchConvGRUMapModel(nn.Module):
-    """Exportable ConvGRU map model for JIT."""
-
-    def __init__(self, model: CNNConvGRUMapModel) -> None:
-        super().__init__()
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
-        self.cnns = nn.ModuleList([copy.deepcopy(model.cnns[g]) for g in model.obs_groups_2d])
-        self.rnn = copy.deepcopy(model.rnn)
-        self.rnn.hidden_state = None  # the exported module keeps its state in the buffer below
-        self.mlp = copy.deepcopy(model.mlp)
-        self.rnn.cpu()
-        self.register_buffer(
-            "hidden_state",
-            torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_channels, self.rnn.state_h, self.rnn.state_w),
-        )
-
-    def forward(self, obs_1d: torch.Tensor, obs_2d: list[torch.Tensor]) -> torch.Tensor:
-        latent_1d = self.obs_normalizer(obs_1d)
-
-        latent_cnn_list = []
-        for i, cnn in enumerate(self.cnns):
-            latent_cnn_list.append(cnn(obs_2d[i]))
-        latent_cnn = torch.cat(latent_cnn_list, dim=-1)
-
-        latent, h = self.rnn.forward_step(latent_1d, latent_cnn, obs_1d, self.hidden_state)
-        self.hidden_state[:] = h  # type: ignore
-        return self.mlp(latent)
-
-    @torch.jit.export
-    def reset(self) -> None:
-        self.hidden_state[:] = 0.0  # type: ignore
-
-
-class _OnnxConvGRUMapModel(nn.Module):
-    """Exportable ConvGRU map model for ONNX."""
-
-    is_recurrent: bool = True
-
-    def __init__(self, model: CNNConvGRUMapModel, verbose: bool) -> None:
-        super().__init__()
-        self.verbose = verbose
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
-        self.cnns = nn.ModuleList([copy.deepcopy(model.cnns[g]) for g in model.obs_groups_2d])
-        self.rnn = copy.deepcopy(model.rnn)
-        self.rnn.hidden_state = None
-        self.mlp = copy.deepcopy(model.mlp)
-
-        self.obs_groups_2d = model.obs_groups_2d
-        self.obs_dims_2d = model.obs_dims_2d
-        self.obs_channels_2d = model.obs_channels_2d
-        self.obs_dim_1d = model.obs_dim
-        self.rnn_type = "gru"
-
-        self.num_layers = self.rnn.num_layers
-        self.hidden_channels = self.rnn.hidden_channels
-        self.state_h = self.rnn.state_h
-        self.state_w = self.rnn.state_w
-
-    def forward(self, obs_1d: torch.Tensor, *obs_2d_and_state: torch.Tensor):
-        *obs_2d, h_in = obs_2d_and_state
-
-        latent_1d = self.obs_normalizer(obs_1d)
-
-        latent_cnn_list = []
-        for i, cnn in enumerate(self.cnns):
-            latent_cnn_list.append(cnn(obs_2d[i]))
-        latent_cnn = torch.cat(latent_cnn_list, dim=-1)
-
-        latent, h = self.rnn.forward_step(latent_1d, latent_cnn, obs_1d, h_in)
-        out = self.mlp(latent)
-        return out, h
-
-    def get_dummy_inputs(self) -> tuple[torch.Tensor, ...]:
-        dummy_1d = torch.zeros(1, self.obs_dim_1d)
-        dummy_2d = []
-        for i in range(len(self.obs_groups_2d)):
-            h, w = self.obs_dims_2d[i]
-            c = self.obs_channels_2d[i]
-            dummy_2d.append(torch.zeros(1, c, h, w))
-        h_in = torch.zeros(self.num_layers, 1, self.hidden_channels, self.state_h, self.state_w)
-        return (dummy_1d, *dummy_2d, h_in)
-
-    @property
-    def input_names(self) -> list[str]:
-        return ["obs", *self.obs_groups_2d, "h_in"]
-
-    @property
-    def output_names(self) -> list[str]:
-        return ["map_flat", "h_out"]
