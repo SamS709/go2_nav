@@ -1058,3 +1058,45 @@ class CNNConvGRUMapModel(MLPModel):
 
     def _get_latent_dim(self) -> int:
         return self.rnn_hidden_dim
+    
+    
+    
+class MapDenoiser(nn.Module):
+    """Pure spatial refinement: takes the already-fused (h_hat, confidence) grid, built externally
+    by an exact Kalman elevation-map update, and outputs a denoised/completed version. No odometry,
+    no scan, no recurrence, no geometry inside this module -- all of that is handled upstream.
+    """
+    def __init__(self, in_channels: int = 2, base_channels: int = 32, activation: str = "elu"):
+        super().__init__()
+        act = _ACTIVATIONS[activation]
+
+        def block(cin, cout, stride=1):
+            return nn.Sequential(nn.Conv2d(cin, cout, 3, stride=stride, padding=1), act())
+
+        # Encoder (downsample twice)
+        self.enc1 = block(in_channels, base_channels)                 # H, W
+        self.enc2 = block(base_channels, base_channels * 2, stride=2)  # H/2
+        self.enc3 = block(base_channels * 2, base_channels * 4, stride=2)  # H/4
+
+        # Bottleneck
+        self.bottleneck = block(base_channels * 4, base_channels * 4)
+
+        # Decoder (upsample twice, with skip connections)
+        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, stride=2)
+        self.dec2 = block(base_channels * 4, base_channels * 2)  # concat skip from enc2
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
+        self.dec1 = block(base_channels * 2, base_channels)      # concat skip from enc1
+
+        self.out_conv = nn.Conv2d(base_channels, 2, 1)  # height, confidence_logit
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        b = self.bottleneck(e3)
+        up2 = F.interpolate(self.up2(b), size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = self.dec2(torch.cat([up2, e2], dim=1))
+        up1 = F.interpolate(self.up1(d2), size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        d1 = self.dec1(torch.cat([up1, e1], dim=1))
+        output = self.out_conv(d1)
+        return F.interpolate(output, size=x.shape[-2:], mode="bilinear", align_corners=False)

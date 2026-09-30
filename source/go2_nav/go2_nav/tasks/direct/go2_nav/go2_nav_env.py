@@ -27,7 +27,7 @@ from isaaclab.terrains import TerrainImporterCfg, TerrainImporter
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
-from .networks.cnn_rnn_model import CNNRNNSeqModel, CNNConvGRUMapModel
+from .networks.cnn_rnn_model import CNNRNNSeqModel, MapDenoiser
 from rsl_rl.models.rnn_model import RNNModel
 
 
@@ -171,7 +171,11 @@ class Go2NavEnv(DirectRLEnv):
         map_h_cells = int(self.cfg.map_height / self.cfg.map_cell_size)
         self.pred_map = torch.zeros(self.num_envs, map_w_cells, map_h_cells, device=self.device)
         self.true_map = torch.zeros_like(self.pred_map)
+        self.raw_map = torch.zeros_like(self.pred_map)
         self.pred_map_confidence = torch.zeros_like(self.pred_map)
+        self.raw_map_confidence = torch.zeros_like(self.pred_map)
+        self._map_variance = torch.full_like(self.pred_map, 1.0e6)
+        self._map_measurement_variance = 0.05**2
         self.map_revealed = torch.zeros(self.num_envs, map_w_cells, map_h_cells, dtype=torch.bool, device=self.device)
         local_x = (torch.arange(map_w_cells, device=self.device) - map_w_cells / 2 + 0.5) * self.cfg.map_cell_size
         local_y = (torch.arange(map_h_cells, device=self.device) - map_h_cells / 2 + 0.5) * self.cfg.map_cell_size
@@ -332,106 +336,74 @@ class Go2NavEnv(DirectRLEnv):
     # MAP MODEL UTILS
     #################################################################
 
-    def _load_map_model(self):
-        map_cell = self.cfg.map_cell_size
-        map_h = int(self.cfg.map_width / map_cell)   # cells along x (dim i)
-        map_w = int(self.cfg.map_height / map_cell)  # cells along y (dim j)
-
-        # Spawn-frame xy of the corner of map cell [0, 0].
-        # Default assumes the map is centered on the spawn point: adapt if yours is not.
-        map_origin = getattr(
-            self.cfg, "map_origin", (-0.5 * self.cfg.map_width, -0.5 * self.cfg.map_height)
-        )
-
-        # 1. Dummy observations used to infer shapes
-        obs = TensorDict(
-            {
-                "height_data": torch.randn(self.num_envs, 2, self.nav_x_cells, self.nav_y_cells),
-                "odom_data": torch.randn(self.num_envs, 13),  # x, y, z, roll, pitch, sin_yaw, cos_yaw, vx, vy, vz, wx, wy, wz
-            },
-            batch_size=[self.num_envs],
-        )
-
-        # 2. Observation groups
-        obs_groups = {"policy": ["height_data", "odom_data"]}
-
-        # 3. CNN config for the height scan
-        cnn_cfg = {
-            "height_data": {
-                "output_channels": [16, 32],
-                "kernel_size": [3, 3],
-                "stride": [2, 2],
-                "activation": "relu",
-                "max_pool": False,
-                "global_pool": "none",   # keep spatial layout
-                "flatten": True,         # 32 * 3 * 6 = 576 latent
-            }
-        }
-
-        # 4. Initialize the model
-        model = CNNConvGRUMapModel(
-            obs=obs,
-            obs_groups=obs_groups,
-            obs_set="policy",
-            output_dim=2 * map_h * map_w,
-            hidden_dims=(64, 64),
-            activation="elu",
-            obs_normalization=True,
-            rnn_type="gru",
-            rnn_hidden_dim=32,
-            rnn_num_layers=1,
-            map_shape=(map_h, map_w),
-            map_resolution=map_cell,
-            map_origin=map_origin,
-            state_stride=2,
-            scan_resolution=1/self.nav_inv_cell_size,          # must match the nav height scanner's actual grid resolution
-            scan_yaw_aligned=True,        # set False if your RayCaster grid is world/spawn-axis-aligned
-            scan_feat_channels=16,
-            input_channels=32,
-            decoder_channels=32,
-            odom_indices=(0, 1, 5, 6),
-        )
-        model = model.to(self.device)
-        model.eval()
-
-        # 5. Test forward pass
-        with torch.no_grad():
-            obs_dict = TensorDict(
-                {
-                    "height_data": obs["height_data"].to(self.device),
-                    "odom_data": obs["odom_data"].to(self.device),
-                },
-                batch_size=[self.num_envs],
-                device=self.device,
-            )
-            out = model(obs_dict)
-            assert out.shape == (self.num_envs, 2 * map_h * map_w), out.shape
-
-        # The test pass filled the hidden state with dummy data: clear it.
-        model.reset()
-
-        print("Map model")
-        print(model)
+    def _load_map_model(self) -> torch.nn.Module:
+        model = MapDenoiser(in_channels=2, base_channels=32).to(self.device)
+        model.train()
         return model
     
 
-    def _build_map_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_map_observations(self) -> torch.Tensor:
+        """Fuse the current scan into the persistent map in the start frame."""
+        ray_hits_w = self._height_scanner.data.ray_hits_w
+        valid = torch.isfinite(ray_hits_w).all(dim=-1)
+        if not torch.any(valid):
+            return torch.stack((self.raw_map, self.raw_map_confidence), dim=1)
 
-        pred_odom = self.pred_odom.clone()
-        yaw = pred_odom[..., 5]
-        obs_map_odom = torch.cat(
-            [
-                pred_odom[..., 0:5],                # x, y, z, roll, pitch
-                torch.sin(yaw).unsqueeze(-1),
-                torch.cos(yaw).unsqueeze(-1),
-                pred_odom[..., 6:12],                # vx, vy, vz, wx, wy, wz
-            ],
-            dim=-1,
-        )  # 13 values
-        
-        return self._sanitize_tensor(
-            obs_map_odom, "obs_map_odom", clamp_abs=1000.0
-        ), self.nav_height_map.clone()
+        env_ids = torch.arange(self.num_envs, device=self.device)[:, None].expand_as(valid)
+        env_ids = env_ids[valid]
+        hits = ray_hits_w[valid]
+
+        # The persistent map is expressed in the episode start frame. The z value
+        # remains world-relative because the start frame only rotates in xy.
+        start_yaw = self.start_yaw_w[env_ids]
+        delta = hits[:, :2] - self.start_pos_w[env_ids, :2]
+        cos_yaw = torch.cos(start_yaw)
+        sin_yaw = torch.sin(start_yaw)
+        local_x = cos_yaw * delta[:, 0] + sin_yaw * delta[:, 1]
+        local_y = -sin_yaw * delta[:, 0] + cos_yaw * delta[:, 1]
+
+        map_w_cells, map_h_cells = self.raw_map.shape[1:]
+        x_idx = torch.floor(
+            (local_x + 0.5 * float(self.cfg.map_width)) / float(self.cfg.map_cell_size)
+        ).long()
+        y_idx = torch.floor(
+            (local_y + 0.5 * float(self.cfg.map_height)) / float(self.cfg.map_cell_size)
+        ).long()
+        in_bounds = (
+            (x_idx >= 0) & (x_idx < map_w_cells) &
+            (y_idx >= 0) & (y_idx < map_h_cells)
+        )
+        if not torch.any(in_bounds):
+            return torch.stack((self.raw_map, self.raw_map_confidence), dim=1)
+
+        env_ids = env_ids[in_bounds]
+        x_idx = x_idx[in_bounds]
+        y_idx = y_idx[in_bounds]
+        measurements = hits[in_bounds, 2]
+        flat_idx = env_ids * (map_w_cells * map_h_cells) + x_idx * map_h_cells + y_idx
+
+        # Average hits landing in one cell before the Kalman update. This keeps
+        # the update fully vectorized and makes the result independent of ray order.
+        sums = torch.zeros(self.num_envs * map_w_cells * map_h_cells, device=self.device)
+        counts = torch.zeros_like(sums)
+        sums.scatter_add_(0, flat_idx, measurements)
+        counts.scatter_add_(0, flat_idx, torch.ones_like(measurements))
+        observed = counts > 0
+        observed_idx = observed.nonzero(as_tuple=False).squeeze(-1)
+        cell_measurements = sums[observed_idx] / counts[observed_idx]
+        env_ids = torch.div(observed_idx, map_w_cells * map_h_cells, rounding_mode="floor")
+        cell_idx = observed_idx % (map_w_cells * map_h_cells)
+
+        prior_variance = self._map_variance.view(-1)[observed_idx]
+        measurement_variance = self._map_measurement_variance / counts[observed_idx]
+        gain = prior_variance / (prior_variance + measurement_variance)
+        fused_map = self.raw_map.view(-1)[observed_idx]
+        fused_map = fused_map + gain * (cell_measurements - fused_map)
+        fused_variance = (1.0 - gain) * prior_variance
+        self.raw_map.view(-1)[observed_idx] = fused_map
+        self._map_variance.view(-1)[observed_idx] = fused_variance
+        self.raw_map_confidence.view(-1)[observed_idx] = 1.0 / (1.0 + fused_variance)
+        return torch.stack((self.raw_map, self.raw_map_confidence), dim=1)
         
     def _update_true_map(self, env_ids: torch.Tensor) -> None:
         n = env_ids.numel()
@@ -465,57 +437,41 @@ class Go2NavEnv(DirectRLEnv):
     def _get_true_map_s(self) -> torch.Tensor:
         return self.true_map.clone()
 
-    def _train_map_step(self, map_obs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def _train_map_step(self, map_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.inference_mode(False), torch.enable_grad():
-            odom_data, height_data = map_obs
-            odom_data, height_data = odom_data.clone(), height_data.clone()
-
-            map_w_cells, map_h_cells = self.true_map.shape[1], self.true_map.shape[2]
-            map_cells = map_w_cells * map_h_cells
-
-            target = self._get_true_map_s()               # (N, W, H)
-            mask = self.map_revealed.to(target.dtype)      # (N, W, H) -- doubles as the confidence label
-
-            obs_dict = TensorDict(
-                {"height_data": height_data, "odom_data": odom_data},
-                batch_size=odom_data.shape[:1],
-            )
-
             self.map_model.train()
-            raw_out: torch.Tensor = self.map_model(obs_dict)
-            if isinstance(raw_out, (tuple, list)):
-                raw_out = raw_out[0]
-            raw_out = raw_out.to(self.device)
+            # Isaac Lab may produce observations as inference tensors.  Detaching
+            # preserves that property, while clone() materializes a tensor that
+            # autograd is allowed to save for the convolution backward pass.
+            map_obs = map_obs.detach().clone()
+            true_map = self.true_map.detach().clone()
+            revealed = self.map_revealed.detach().clone()
+            output = self.map_model(map_obs)
+            pred_height = output[:, 0]
+            pred_confidence = torch.sigmoid(output[:, 1])
 
-            height_pred = raw_out[:, :map_cells].reshape(self.num_envs, map_w_cells, map_h_cells)
-            conf_logits = raw_out[:, map_cells:].reshape(self.num_envs, map_w_cells, map_h_cells)
-
-            # 1. Height regression -- ONLY on revealed cells, same as before.
-            per_elem_height_loss = F.smooth_l1_loss(height_pred, target, reduction="none")
-            height_loss = (per_elem_height_loss * mask).sum() / mask.sum().clamp(min=1.0)
-
-            # 2. Confidence classification -- supervised EVERYWHERE, since the
-            # label (revealed or not) is known for every cell regardless.
-            confidence_loss = F.binary_cross_entropy_with_logits(conf_logits, mask)
-
+            if torch.any(revealed):
+                height_loss = F.smooth_l1_loss(pred_height[revealed], true_map[revealed])
+            else:
+                height_loss = pred_height.sum() * 0.0
+            confidence_loss = F.binary_cross_entropy(pred_confidence, revealed.float())
             loss = height_loss + 0.5 * confidence_loss
 
             self.map_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.map_model.parameters(), max_norm=1.0)
             self.map_optimizer.step()
-            self.map_model.detach_hidden_state()
             self.map_model.eval()
 
             self.extras.setdefault("log", {})
-            self.extras["log"].update({
-                "map/loss_total": loss.detach(),
-                "map/loss_height": height_loss.detach(),
-                "map/loss_confidence": confidence_loss.detach(),
-            })
-
-            pred_confidence = torch.sigmoid(conf_logits).detach()
-            return height_pred.detach(), pred_confidence
+            self.extras["log"].update(
+                {
+                    "map/loss_total": loss.detach(),
+                    "map/loss_height": height_loss.detach(),
+                    "map/loss_confidence": confidence_loss.detach(),
+                }
+            )
+            return pred_height.detach(), pred_confidence.detach()
     
     def _precompute_global_heightfield(self):
         if self._heightfield_ready:
@@ -1456,12 +1412,7 @@ class Go2NavEnv(DirectRLEnv):
         with torch.no_grad():
             self.odom_model.reset(odom_reset_mask)
             
-        map_reset_mask = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
-        map_reset_mask[env_ids_tensor] = True
-        with torch.no_grad():
-            self.map_model.reset(map_reset_mask)
+        
 
         self.tick_count_env[env_ids_tensor] = 0
 
