@@ -11,7 +11,7 @@ The navigation planner is separated from low-level gait control. A pretrained lo
 ## System Overview
 
 ```text
-Go2 simulation
+Go2 simulation and terrain
     |-- proprioception + cmd_vel + local height map
     |       --> locomotion_policy --> joint actions --> joint targets
     |
@@ -20,13 +20,19 @@ Go2 simulation
     |                              |
     |                              +--> short/long position histories
     |
-    |-- navigation height map + predicted odometry
-    |       --> map_model --> predicted height map + confidence map
+    |-- delayed navigation height map
+    |       --> persistent start-frame map
+    |             (cell placement + Kalman height/confidence fusion)
+    |       --> MapDenoiser --> predicted height map + confidence map
     |
     +-- planner observations --> RL planner --> [vx, vy, wz]
 ```
 
 The planner uses a student/teacher observation setup. The actor or student sees onboard-style observations and the predicted map. The critic or teacher additionally receives privileged simulator information, including true odometry, maze information, and the true map.
+
+`go2_nav_env.py` is a vectorized `DirectRLEnv`. It owns the robot, terrain, sensors, online odometry and map learners, episode-frame transforms, maze path tables, reward terms, and student/teacher observation construction. The planner does not directly control joints: its three velocity commands are passed through the locomotion policy before being applied to the robot.
+
+The map pipeline separates geometry from learning. The environment places navigation-grid measurements into a persistent map using robot pose and exact tensor operations. The learned map model only denoises and completes the resulting two-channel image; it does not receive odometry or raw coordinates.
 
 ## Installation
 
@@ -46,17 +52,22 @@ python scripts/list_envs.py
 
 The registered task is `Template-Go2-Nav-Direct-v0`.
 
-## Training Flow
+## Environment Execution
 
-Each policy step runs this sequence:
+Each call to `step()` follows this sequence in `_pre_physics_step`:
 
-1. The planner receives its observation groups and outputs the three-dimensional action `[vx, vy, wz]`.
-2. The environment copies this action directly into `cmd_vel`.
-3. The locomotion policy receives delayed proprioception, the current `cmd_vel`, the previous locomotion action, and a delayed local height map. It outputs joint actions that are scaled by `0.25` and added to the default Go2 joint pose.
-4. The odometry model receives a history of delayed proprioception, current `cmd_vel`, locomotion actions, and its previous odometry prediction. It is trained online against simulator odometry.
-5. The predicted odometry updates the short-term and long-term position histories.
-6. The map model receives the delayed navigation height map and predicted odometry. It predicts both a global height map and a confidence map.
-7. The planner receives the updated observations. The simulator advances with the low-level joint targets and computes rewards and termination conditions.
+1. The planner action `[vx, vy, wz]` is copied into `cmd_vel`.
+2. The locomotion observation builder creates delayed proprioception, command/action features, and a local heightmap. The frozen locomotion policy returns joint actions.
+3. The recurrent odometry model consumes delayed proprioception history, commands, locomotion actions, and its previous prediction. It is trained online against simulator state in the episode start frame.
+4. The predicted odometry updates the short-term and long-term position histories.
+5. The environment marks the area around the robot as revealed, builds the delayed navigation heightmap, places its valid cells into the persistent start-frame map, and trains the map model.
+6. The environment returns student and teacher observations. Low-level joint targets are applied and the simulator advances.
+
+The map update runs before `_get_observations`, so the same `self.nav_heightmap` produced for the current control step is used by both map fusion and the student observation.
+
+### Episode reset
+
+`_reset_idx` resets the robot, locomotion hidden state, odometry hidden state, command/action histories, predicted odometry, position histories, stall counters, goals, and start poses. It rebuilds the true start-frame map from the global terrain heightfield, clears the reveal mask, reveals the initial area around the start, and resets/resamples delay buffers for the environments being reset. Curriculum updates can move an environment to another terrain level and refresh its maze path table.
 
 ### Planner training modes
 
@@ -99,7 +110,7 @@ The student receives:
   - Long-term predicted position history: `50 x 3` values.
   - Predicted roll, pitch, and yaw velocity/state slice from odometry: 3 values.
   - Current planner command `cmd_vel`: 3 values.
-- `student_height_scan`: the delayed navigation height scan, currently one channel with shape `[1, 17, 30]` from the `0.2 m` navigation grid.
+- `student_height_scan`: the delayed navigation height scan with two channels and shape `[2, 17, 30]` from the `0.2 m` navigation grid. Channel 0 is height and channel 1 is the valid-cell mask.
 - `student_map`: two map channels:
   - Channel 0: predicted global height map.
   - Channel 1: predicted map confidence.
@@ -120,13 +131,32 @@ The teacher receives:
 
 The teacher observation is used by the critic or distillation teacher and is not intended to represent deployable sensor input.
 
+## Navigation Heightmap and Persistent Map
+
+The navigation scan is built by `_compute_height_data_from_cloud` and `_build_nav_heightmap`:
+
+1. Ray hits are transformed from world coordinates into the height scanner frame.
+2. Hits are rasterized into the configured navigation grid (`x = -0.4..3.0 m`, `y = -3.0..3.0 m`, cell size `0.2 m`).
+3. Each grid cell stores its height and whether it contains a valid hit. The grid is flipped along the x axis to match the policy convention.
+4. Optional dropout and delay are applied to the student navigation grid. The resulting tensor is stored in `self.nav_heightmap` and reused by both the map path and `student_height_scan`.
+
+The environment maintains per-environment persistent map buffers at the `50 m x 50 m` map resolution:
+
+- `raw_map`: Kalman-fused height estimate.
+- `_map_variance`: per-cell uncertainty, initialized to a large prior variance.
+- `raw_map_confidence`: bounded confidence derived from the variance as `1 / (1 + variance)`.
+- `map_revealed`: fog-of-war mask used for supervision and plotting.
+- `true_map`: simulator-derived heightfield sampled in the episode start frame.
+
+For every valid navigation cell, the environment uses the cell center in the robot frame, rotates it by the robot yaw into world coordinates, then rotates it into the episode start frame. Measurements that land in the same global map cell are averaged before a vectorized Kalman update. This means deployment only needs the navigation heightmap and the robot pose/odometry needed to place it; the map network does not perform geometric placement.
+
 ## Delay Buffers
 
 When `delay = True`, the environment uses three delay buffers:
 
 1. **`_proprio_delay_buffer`** delays proprioceptive state groups. It affects the proprioceptive input used by the locomotion and odometry paths.
 2. **`_loc_heightmap_delay_buffer`** delays the local height map sent to `locomotion_policy`.
-3. **`_nav_heightmap_delay_buffer`** delays the navigation height map sent to the planner and map path.
+3. **`_nav_heightmap_delay_buffer`** delays the two-channel navigation height map sent to the planner and map path.
 
 The local and navigation height maps come from the same height sensor, so the environment samples one shared time-lag tensor and applies the same delay to both height-map buffers. This keeps the two views temporally consistent.
 
@@ -208,29 +238,29 @@ loss = MSE(position) + MSE(orientation)
 
 ### `map_model`
 
-**Role:** infer a global height map from partial navigation height observations and predicted odometry.
+**Role:** denoise and complete the persistent, already-placed map. Geometry, memory, and coordinate transforms are handled by the environment rather than by the network.
 
-**Structure:** `CNNRNNSeqModel` with a two-layer CNN, odometry features, a one-layer GRU with hidden size 64, and an MLP head with hidden layers `(128, 64)`.
+**Structure:** `MapDenoiser`, a stateless 2D convolutional encoder-decoder with skip connections. It downsamples twice, uses a convolutional bottleneck, and restores the original map resolution with interpolation-aligned decoder features. It has no RNN and no odometry input.
 
-**Input:**
+**Input:** a two-channel map image with shape `[B, 2, map_x_cells, map_y_cells]`:
 
-- Delayed navigation height map from the shared height sensor.
-- Current predicted 12-value odometry.
+- Channel 0: `raw_map`, the Kalman-fused height estimate.
+- Channel 1: `raw_map_confidence`, the bounded uncertainty/confidence channel.
 
-**Output:** two flattened map predictions:
+**Output:** two map channels with the same spatial shape:
 
-- Height prediction for every global map cell.
-- Confidence logit for every global map cell.
+- Channel 0: refined height prediction.
+- Channel 1: confidence prediction after a sigmoid.
 
-The map loss is:
+The model is trained online on each control step. Height regression uses Smooth L1 loss only on revealed cells. Confidence uses binary cross-entropy against `map_revealed` over the full map:
 
 ```text
-height_loss = masked SmoothL1(height_prediction, true_map)
-confidence_loss = BCEWithLogits(confidence_logits, map_revealed)
+height_loss = masked SmoothL1(predicted_height, true_map)
+confidence_loss = BCE(predicted_confidence, map_revealed)
 loss = height_loss + 0.5 * confidence_loss
 ```
 
-Height regression is applied only to revealed cells. Confidence classification is applied everywhere because the simulator knows which cells have been revealed.
+`true_map` is generated by sampling the simulator’s global heightfield in the episode start frame. It is a training target and is returned only in `teacher_map`; it is not an input to the deployable map path.
 
 ## Repository Layout
 

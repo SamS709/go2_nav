@@ -176,6 +176,13 @@ class Go2NavEnv(DirectRLEnv):
         self.raw_map_confidence = torch.zeros_like(self.pred_map)
         self._map_variance = torch.full_like(self.pred_map, 1.0e6)
         self._map_measurement_variance = 0.05**2
+        self.nav_heightmap = torch.zeros(
+            self.num_envs,
+            2,
+            self.nav_x_cells,
+            self.nav_y_cells,
+            device=self.device,
+        )
         self.map_revealed = torch.zeros(self.num_envs, map_w_cells, map_h_cells, dtype=torch.bool, device=self.device)
         local_x = (torch.arange(map_w_cells, device=self.device) - map_w_cells / 2 + 0.5) * self.cfg.map_cell_size
         local_y = (torch.arange(map_h_cells, device=self.device) - map_h_cells / 2 + 0.5) * self.cfg.map_cell_size
@@ -342,25 +349,71 @@ class Go2NavEnv(DirectRLEnv):
         return model
     
 
+    def _build_nav_heightmap(self) -> torch.Tensor:
+        height_data, valid = self._compute_height_data_from_cloud(
+            randomize=self.cfg.randomize,
+            apply_dropout=self.cfg.randomize,
+            locomotion=False,
+        )
+        height_data = height_data.view(
+            self.num_envs, self.nav_x_cells, self.nav_y_cells
+        ).flip(dims=[1])
+        valid = valid.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(
+            dims=[1]
+        )
+        height_data = self._sanitize_tensor(
+            height_data, "height_data_nav", clamp_abs=10.0
+        )
+        nav_heightmap = torch.stack([height_data, valid], dim=1)
+        if self.cfg.delay:
+            nav_heightmap = self._nav_heightmap_delay_buffer.compute(nav_heightmap)
+        self.nav_heightmap = nav_heightmap
+        return nav_heightmap
+
     def _build_map_observations(self) -> torch.Tensor:
-        """Fuse the current scan into the persistent map in the start frame."""
-        ray_hits_w = self._height_scanner.data.ray_hits_w
-        valid = torch.isfinite(ray_hits_w).all(dim=-1)
+        """Fuse the navigation heightmap into the persistent start-frame map."""
+        nav_heightmap = self.nav_heightmap
+        heights = nav_heightmap[:, 0]
+        valid = nav_heightmap[:, 1].bool()
+
         if not torch.any(valid):
             return torch.stack((self.raw_map, self.raw_map_confidence), dim=1)
 
-        env_ids = torch.arange(self.num_envs, device=self.device)[:, None].expand_as(valid)
-        env_ids = env_ids[valid]
-        hits = ray_hits_w[valid]
+        nav_x_min = float(self.cfg.nav_x_range[0])
+        nav_y_min = float(self.cfg.nav_y_range[0])
+        nav_cell_size = float(self.cfg.nav_cell_size)
+        nav_x = nav_x_min + (torch.arange(self.nav_x_cells, device=self.device) + 0.5) * nav_cell_size
+        nav_y = nav_y_min + (torch.arange(self.nav_y_cells, device=self.device) + 0.5) * nav_cell_size
+        nav_x, nav_y = torch.meshgrid(nav_x, nav_y, indexing="ij")
+        nav_points = torch.stack((nav_x.flip(0), nav_y), dim=-1)
+        nav_points = nav_points.reshape(1, -1, 2).expand(self.num_envs, -1, -1)
 
-        # The persistent map is expressed in the episode start frame. The z value
-        # remains world-relative because the start frame only rotates in xy.
+        valid_flat = valid.reshape(self.num_envs, -1)
+        heights_flat = heights.reshape(self.num_envs, -1)
+        env_ids = torch.arange(self.num_envs, device=self.device)[:, None].expand_as(valid_flat)
+        env_ids = env_ids[valid_flat]
+        local_points = nav_points[valid_flat]
+        measurements = heights_flat[valid_flat]
+
+        # Convert navigation-frame cell centers to the episode start frame.
+        robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)[env_ids]
+        cos_robot = torch.cos(robot_yaw)
+        sin_robot = torch.sin(robot_yaw)
+        world_delta_x = cos_robot * local_points[:, 0] - sin_robot * local_points[:, 1]
+        world_delta_y = sin_robot * local_points[:, 0] + cos_robot * local_points[:, 1]
+        world_points = torch.stack(
+            (
+                self._robot.data.root_pos_w[env_ids, 0] + world_delta_x,
+                self._robot.data.root_pos_w[env_ids, 1] + world_delta_y,
+            ),
+            dim=-1,
+        )
         start_yaw = self.start_yaw_w[env_ids]
-        delta = hits[:, :2] - self.start_pos_w[env_ids, :2]
-        cos_yaw = torch.cos(start_yaw)
-        sin_yaw = torch.sin(start_yaw)
-        local_x = cos_yaw * delta[:, 0] + sin_yaw * delta[:, 1]
-        local_y = -sin_yaw * delta[:, 0] + cos_yaw * delta[:, 1]
+        delta = world_points - self.start_pos_w[env_ids, :2]
+        cos_start = torch.cos(start_yaw)
+        sin_start = torch.sin(start_yaw)
+        local_x = cos_start * delta[:, 0] + sin_start * delta[:, 1]
+        local_y = -sin_start * delta[:, 0] + cos_start * delta[:, 1]
 
         map_w_cells, map_h_cells = self.raw_map.shape[1:]
         x_idx = torch.floor(
@@ -379,7 +432,7 @@ class Go2NavEnv(DirectRLEnv):
         env_ids = env_ids[in_bounds]
         x_idx = x_idx[in_bounds]
         y_idx = y_idx[in_bounds]
-        measurements = hits[in_bounds, 2]
+        measurements = measurements[in_bounds]
         flat_idx = env_ids * (map_w_cells * map_h_cells) + x_idx * map_h_cells + y_idx
 
         # Average hits landing in one cell before the Kalman update. This keeps
@@ -1055,8 +1108,8 @@ class Go2NavEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         # actions = [vxd, vyd, wzd]
-        self.cmd_vel.copy_(actions)
         self.prev_cmd_vel.copy_(self.cmd_vel)
+        self.cmd_vel.copy_(actions)
 
         # 1. Locomotion policy
         proprio_obs_loc, height_data_loc = self._build_locomotion_observations()
@@ -1075,6 +1128,7 @@ class Go2NavEnv(DirectRLEnv):
             torch.arange(self.num_envs, device=self.device),
             self._robot.data.root_pos_w[:, :2],
         )
+        self._build_nav_heightmap()
         map_obs = self._build_map_observations()
         pred_h, pred_c = self._train_map_step(map_obs)
         self.pred_map.copy_(pred_h)
@@ -1091,41 +1145,22 @@ class Go2NavEnv(DirectRLEnv):
         )
         self._robot.set_joint_position_target(low_level_joint_targets)
 
+
     def _get_observations(self) -> dict:
-        
+
         height_data_teacher, valid_teacher = self._compute_height_data_from_cloud(
-            randomize=False, apply_dropout=False,locomotion=False
+            randomize=False, apply_dropout=False, locomotion=False
         )
-        height_data_teacher = (
-            height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
-            .flip(dims=[1])
+        height_data_teacher = height_data_teacher.view(
+            self.num_envs, self.nav_x_cells, self.nav_y_cells
+        ).flip(dims=[1])
+        height_data_teacher = self._sanitize_tensor(
+            height_data_teacher, "height_data_teacher", clamp_abs=10.0
         )
-        height_data_teacher = self._sanitize_tensor(height_data_teacher, "height_data_loc", clamp_abs=10.0)
-        valid_teacher = (
-            valid_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
-            .flip(dims=[1])
-        )
-        
+        valid_teacher = valid_teacher.view(
+            self.num_envs, self.nav_x_cells, self.nav_y_cells
+        ).flip(dims=[1])
         height_data_teacher = torch.stack([height_data_teacher, valid_teacher], dim=1)
-        
-        height_data_student, valid_student = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize, locomotion=False
-        )
-        
-        height_data_student = (
-            height_data_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
-            .flip(dims=[1])
-        )
-        height_data_student = self._sanitize_tensor(height_data_student, "height_data_loc", clamp_abs=10.0)
-        valid_student = (
-            valid_student.view(self.num_envs, self.nav_x_cells, self.nav_y_cells)
-            .flip(dims=[1])
-        )
-        
-        height_data_student = torch.stack([height_data_student, valid_student], dim=1)
-        
-        if self.cfg.delay:
-            self.nav_height_map = self._nav_heightmap_delay_buffer.compute(height_data_student)
 
         goal_xy_s = self._get_goal_pos_s()
         goal_yaw_s = self._get_goal_yaw_s()
@@ -1195,7 +1230,7 @@ class Go2NavEnv(DirectRLEnv):
 
         return {
             "student_proprio": student_proprio,
-            "student_height_scan": self.nav_height_map.clone(),
+            "student_height_scan": self.nav_heightmap.clone(),
             "student_map": pred_map_conf,
             "teacher_proprio": teacher_proprio,
             "teacher_height_scan": height_data_teacher,
@@ -1581,7 +1616,10 @@ class Go2NavEnv(DirectRLEnv):
 
         valid = torch.isfinite(rays_flat).all(dim=1)
         if not torch.any(valid):
-            return torch.zeros((num_envs, num_cells), device=self.device)
+            return (
+                torch.zeros((num_envs, num_cells), device=self.device),
+                torch.zeros((num_envs, num_cells), dtype=torch.bool, device=self.device),
+            )
 
         rays_valid = rays_flat[valid]
         env_ids = env_ids[valid]
@@ -1590,7 +1628,10 @@ class Go2NavEnv(DirectRLEnv):
         y_idx = torch.floor((rays_valid[:, 1] - y_min) * inv_cell_size).long()
         in_bounds = (x_idx >= 0) & (x_idx < x_cells) & (y_idx >= 0) & (y_idx < y_cells)
         if not torch.any(in_bounds):
-            return torch.zeros((num_envs, num_cells), device=self.device)
+            return (
+                torch.zeros((num_envs, num_cells), device=self.device),
+                torch.zeros((num_envs, num_cells), dtype=torch.bool, device=self.device),
+            )
 
         x_idx = x_idx[in_bounds]
         y_idx = y_idx[in_bounds]
