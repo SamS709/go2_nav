@@ -28,18 +28,6 @@ All pipeline figures use the same colours.
 
 ![Diagram legend](docs/images/legend.jpg)
 
-| Colour | Meaning | Examples |
-|---|---|---|
-| Red / pink | Simulator or sensor | robot, height scanner, ground-truth pose |
-| Green | Signal, buffer or state | `proprio(t)`, `pose_est`, `odom_buffer` |
-| Orange | Learned model | `locomotion_policy` (frozen), `odom_model`, `EgoMapDenoiser` |
-| Yellow, dashed | Exact computation, nothing learned | integrator, scan-to-map matching, ego crop |
-| Purple | Persistent map | Kalman fusion, `raw_map`, `map_variance` |
-| Blue | RL planner | planner, reward |
-| Grey dashed pill | Tag: same signal as the box with that name | `cmd_vel`, `pose_est hist` |
-
-Tags exist only to avoid long crossing arrows.
-
 ---
 
 ## 2. Pipeline overview
@@ -47,29 +35,6 @@ Tags exist only to avoid long crossing arrows.
 ![Full pipeline](docs/images/go2_nav_pipeline.jpg)
 
 The figure has three lanes. One `env.step()` runs them in this order (all in `_pre_physics_step`, then `_get_observations`).
-
-### Lane 1: locomotion (frozen)
-
-1. The planner action `[vx, vy, wz]` becomes `cmd_vel`. The previous command is stored first (for the command-rate penalty).
-2. The environment builds `proprio(t)` (base angular velocity, projected gravity, joint positions relative to default, joint velocities; noise and delay when enabled) and the local height map `loc_heightmap` (delayed).
-3. The frozen `locomotion_policy` (recurrent TorchScript) receives `proprio(t)`, `cmd_vel`, its previous action and the local height map, and outputs 12 joint actions.
-4. `joint_target = default_joint_pos + 0.25 * action` is applied to the robot.
-
-### Lane 2: perception
-
-5. **Odometry chain** (bottom row of the lane). `odom_buffer` stacks the last 10 frames of `[proprio, cmd_vel, locomotion action]`. `odom_model` (running-stat normalisation, GRU, MLP) predicts roll, pitch, body linear velocity and body angular velocity (`odom_out`, 8 values). The **integrator** dead-reckons these into `pose_est = [x, y, z, yaw]` in the start frame. The network never predicts an absolute position.
-6. **Map chain** (top row of the lane). The height scanner's ray hits are expressed in the body frame (`map scan`), delayed with the same lag as the other height buffers, and placed with the pose the robot had **at capture time** (`pose_est hist`).
-   - **Scan-to-map matching** compares the delayed scan to cells the map already knows and, when the evidence is good, nudges `pose_est` (dashed `Δpose nudge` arrow).
-   - **Kalman fusion** updates `raw_map` and `map_variance` per cell.
-   - **Ego crop** samples a yaw-aligned window centred on `pose_est`.
-   - **EgoMapDenoiser** turns that crop into predicted height and confidence.
-
-### Lane 3: planner
-
-7. The green group is what the student/actor sees. Everything is expressed **relative to the estimated pose**: goal, short and long position buffers, predicted velocities, command, the navigation height scan, and the ego map.
-8. The RL planner (CNN + GRU, PPO) outputs the next `cmd_vel`, which goes back to lane 1 and to `odom_buffer` (tags).
-
-Only the odometry model and the map denoiser are trained online during the planner's training run. The locomotion policy is frozen.
 
 ---
 
@@ -99,12 +64,9 @@ Heights in the persistent map are **tile-relative**: `z_world - env_origin_z`. E
 The terrain is a grid of maze tiles. In the figure:
 
 - **ROW** (red) and **COL** (green) are the two axes of the tile grid. Inside every tile the small red and green arrows show the maze's own row and column directions.
-- The yellow circle marks the tile at the world frame.
 - Maze size grows along the curriculum. The cyan **`move_up`** arrow points toward larger mazes, the magenta **`move_down`** arrow toward the small one-row corridors.
 
 Curriculum rule (from `_reset_idx`): the success rate of each terrain cell is tracked with a running average. An environment moves up when its cell's success rate is above 0.8, and moves down when the robot died and the success rate is below 0.2.
-
-Maze size per level (from `_update_goals`): levels 0 and 1 both give a 1-row maze, level `k >= 2` gives a `k`-row maze, clamped to the maximum. The number of columns is always the fixed maximum.
 
 ### 4.2 Maze tensor
 
@@ -112,8 +74,13 @@ Maze size per level (from `_update_goals`): levels 0 and 1 both give a 1-row maz
 
 Each maze is stored as a tensor of shape `[MAX_MAZE_ROWS, MAX_MAZE_COLS, 5]`:
 
-- channel `0`: cell type (one-hot encoded into the teacher observation);
-- channels `1` to `4`: one wall flag per cell side.
+#### Channel 0
+Channel `0`: corresponds to the celle tye (one-hot when passed in the teacher network);
+
+![Example maze](docs/images/example_maze.png)
+
+#### Channels 1 to 4
+Channels `1` to `4`: one wall flag per cell side.
 
 In the figure, with `max_rows = 8`, each wall channel is drawn next to the side of the maze it describes:
 
@@ -123,6 +90,8 @@ In the figure, with `max_rows = 8`, each wall channel is drawn next to the side 
 | `maze_tensor[:, :, 2]` | EAST |
 | `maze_tensor[:, :, 3]` | SOUTH |
 | `maze_tensor[:, :, 4]` | WEST |
+
+![Example maze](docs/images/maze_conventions.png)
 
 A non-zero entry means the cell has a wall on that side. The coloured segments on the maze are the walls that the corresponding tensor marks.
 
@@ -136,14 +105,6 @@ A non-zero entry means the cell has a wall on that side. The coloured segments o
 | col + 1 | 2 | 4 |
 
 So, in tensor indexing, channel 3 is the wall on the `row - 1` side and channel 1 the wall on the `row + 1` side. This is consistent with the figure once you remember that recorded rows are flipped relative to the original rows (see 4.4).
-
-> **Check this.** The commented-out debug prints in `log_infos` label channel 3 as "north" and channel 1 as "south", which is the opposite of the figure. Pathing only depends on the pairing above, so it is not affected, but one of the two labellings is stale.
-
-### 4.3 Example maze
-
-![Example maze](docs/images/example_maze.png)
-
-A rendered maze next to a 2D slice of its tensor (`max_rows = 8`, 4 columns). Use it to check your reading of the conventions: compare each row/column of the printed tensor with the cell it should describe in the render. The figure does not say which channel is printed, so add that to the caption if you reuse it.
 
 ### 4.4 From world coordinates to maze cells
 
@@ -371,92 +332,7 @@ Environments that just reset see a blank map observation for their first step, b
 
 ---
 
-## 8. Configuration reference
-
-All entries below are optional. They are read with `getattr(cfg, name, default)`, so the config file does not need to change.
-
-| Name | Default | Meaning |
-|---|---|---|
-| `train_perception` | `True` | train odom and map models online; `False` freezes them |
-| `perception_checkpoint` | `None` | file written by `save_perception_models` |
-| `odom_lr`, `map_lr` | `1e-3` | learning rates |
-| `gyro_bias_max` | `0.01` | rad/s, per-episode gyro bias |
-| `map_crop_cells` | `64` | ego crop size in cells |
-| `map_scan_noise` | `0.01` | m, z noise of the map scan |
-| `map_scan_max_range` | `6.0` | m, maximum xy range of used hits |
-| `map_meas_std` | `0.05` | m, per-hit height std in the Kalman filter |
-| `map_min_variance` | `1e-4` | variance floor |
-| `map_observed_var_thresh` | `1.0` | a cell counts as observed below this variance |
-| `map_drift_var_gain` | `0.02` | measurement std added per metre since the last correction |
-| `map_conf_ref_std` | `0.1` | m, std giving planner confidence 0.5 |
-| `map_w_complete`, `map_w_unseen` | `0.5`, `0.05` | loss weights for seen-unobserved and never-seen cells |
-| `scan_match` | `True` | enable scan-to-map correction |
-| `match_period` | `2` | run matching every k control steps |
-| `match_xy_range`, `match_xy_steps` | `0.2`, `5` | translation search (steps must be odd) |
-| `match_yaw_range_deg`, `match_yaw_steps` | `3.0`, `5` | rotation search (steps must be odd) |
-| `match_max_points`, `match_chunk` | `256`, `128` | rays per match, environments per chunk (GPU memory) |
-| `match_var_thresh` | `0.05` | only cells below this variance are matched against |
-| `match_min_points` | `40` | minimum overlapping known cells |
-| `match_improve_thresh` | `0.3` | required improvement over zero offset |
-| `match_axis_obs_thresh` | `0.5` | minimum score-profile range for an axis to be corrected |
-| `match_gain`, `match_gain_z` | `0.5`, `0.5` | fraction of the found offset that is applied |
-
-`match_xy_range / (match_xy_steps - 1)` should be close to `map_cell_size`, otherwise candidates land on the same cells.
-
-The shapes of `student_map` and `teacher_map` depend on `map_crop_cells`. If the agent configuration hard-codes them, update both.
-
-### Pretraining and freezing the perception models
-
-The odometry and map models are trained online, so the planner's input distribution moves while it trains. A stable workflow:
-
-1. Run a first training with `train_perception=True`.
-2. Call `env.save_perception_models("perception.pt")`.
-3. For the PPO runs, set `perception_checkpoint="perception.pt"` and `train_perception=False`.
-
----
-
-## 9. Metrics and debugging
-
-### Logged per step
-
-| Key | What it tells you |
-|---|---|
-| `odom/ate_xy_corrected`, `odom/ate_xy_dead_reckoning` | position error with and without scan matching. Matching helps if the first is lower |
-| `odom/yaw_err_corrected`, `odom/yaw_err_dead_reckoning` | same for yaw |
-| `odom/z_err_corrected` | z drift after correction |
-| `odom/loss_*` | odometry loss terms |
-| `map/raw_mae_observed` | error of the Kalman map on observed cells. Should be a few centimetres |
-| `map/pred_mae_observed` | error after the denoiser. If not below the raw value, the denoiser is not earning its compute |
-| `map/pred_mae_seen_unobserved` | completion error |
-| `map/loss_*` | map loss terms |
-| `match/accept_rate`, `match/mean_abs_dxy`, `match/mean_abs_dz` | how often and how much the pose is corrected |
-
-### Suggested first checks
-
-1. **Registration.** Run with `scan_match=False` and check `map/raw_mae_observed`. A large value points to a frame or placement problem (axis sign, sensor offset, z reference).
-2. **Does matching help?** Compare the two `odom/ate_xy_*` curves. Randomise gyro bias and friction so there is real drift to correct.
-3. **Does the denoiser help?** Compare `map/pred_mae_observed` with `map/raw_mae_observed`, and train the planner once with the raw map as input.
-
-### Debug plot
-
-With `cfg.plot` enabled, `_plot_map_s` writes images to `map_debug/env{i}/plot{j}.png` when the plotted environment resets. Panels: true map (dimmed where never seen) with the true pose (blue x) and estimated pose (red +), fused raw map, and the ego input, prediction, target and confidence.
-
----
-
-## 10. Moving to a real robot
-
-The sim-only parts are the true pose, `map_seen_gt`, `true_map` and the teacher outputs. The code downstream of the map scan can stay as it is, but `_build_map_scan` must be replaced by a real point stream `(x_b, y_b, z_rel)`.
-
-What the simulated scan silently provides and the real pipeline must supply:
-
-- **Gravity alignment.** The simulator applies only yaw to world hits, so roll and pitch are perfect. On the robot, transform raw points with the sensor extrinsics and the estimated roll and pitch.
-- **Top-surface heights.** The simulated scanner shoots rays downward and returns top surfaces. A real lidar or depth camera also returns wall sides. Rasterise to one maximum-height value per cell before fusion; the current fusion averages hits.
-- **Sensor characteristics.** Range, noise, dropouts and occlusions will differ. Randomise them in simulation.
-- **Delay.** On the robot, use the point-cloud timestamp to select the pose from your own pose buffer.
-
----
-
-## 11. Known limitations
+## 8. Known limitations
 
 - The environment rewrite has not been run in Isaac Lab by its author. Tensor shapes and the `DelayBuffer` and `raycast_mesh` interfaces are untested.
 - The yaw correction from scan matching is applied to the current pose, not rotated about the capture-time position. This is a second-order effect for corrections of at most a few degrees.
