@@ -1501,8 +1501,8 @@ class Go2NavEnv(DirectRLEnv):
     def log_infos(self):
         if self.cfg.vis:
             self.env_markers.visualize(
-                translations=self._robot.data.root_pos_w[self.vis_envs].unsqueeze(0),
-                orientations=self._robot.data.root_quat_w[self.vis_envs].unsqueeze(0),
+                translations=self._robot.data.root_pos_w[self.vis_envs],
+                orientations=self._robot.data.root_quat_w[self.vis_envs],
             )
 
     def _get_rewards(self) -> torch.Tensor:
@@ -1586,6 +1586,8 @@ class Go2NavEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        print(self.max_episode_length)
+        print(self.episode_length_buf)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         goal_distance = torch.linalg.norm(self.goal_pos_w[:, :2] - self._robot.data.root_pos_w[:, :2], dim=-1)
@@ -1609,7 +1611,9 @@ class Go2NavEnv(DirectRLEnv):
         if env_ids is not None and len(env_ids) != self.num_envs and self.cfg.plot:
             plot = False
             for env_id in env_ids:
-                if env_id in self.vis_envs.tolist():
+                cond = env_id in self.vis_envs.tolist()
+                print(cond)
+                if cond:
                     plot = True
             if plot:
                 self._plot_map_s(self.vis_envs, save_dir="/mnt/D/dev/robotics/nvidia/isaaclab/go2_nav/map_debug")
