@@ -325,7 +325,7 @@ Environments that just reset see a blank map observation for their first step, b
 | Item | Controlled by |
 |---|---|
 | noise on proprioception | `cfg.randomize` |
-| scan offset, yaw and roll misalignment of the policy-convention scan | `cfg.max_offset`, `cfg.max_rot` (set `max_rot = 0` to disable) |
+| 3D scan offset, yaw and roll misalignment of the policy-convention scan | `cfg.max_offset`, `cfg.max_rot` (set `max_rot = 0` to disable) |
 | cell dropout on the navigation and local grids | `cfg.n_zeros`, `cfg.sigma`, `cfg.max_reset_zeros_freq` |
 | z noise on the map scan | `map_scan_noise` (needs `cfg.randomize`) |
 | gyro bias per episode | `gyro_bias_max` (needs `cfg.randomize`) |

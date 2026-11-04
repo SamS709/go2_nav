@@ -45,7 +45,7 @@ from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.assets import Articulation, RigidObject
 import isaaclab.utils.math as math_utils
 from isaaclab.envs import DirectRLEnv
-from isaaclab.utils.math import quat_apply, quat_conjugate, sample_uniform
+from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils.buffers import DelayBuffer
 from isaaclab.terrains import TerrainImporterCfg, TerrainImporter
@@ -55,6 +55,21 @@ from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
 from .networks.cnn_rnn_model import CNNRNNSeqModel  # noqa: F401  (kept: may be needed for model registration)
 from rsl_rl.models.rnn_model import RNNModel
+
+
+def rotate_roll_pitch(points: torch.Tensor, roll: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
+    """Undo roll and pitch so body-frame points are expressed in a level body frame."""
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    x, y, z = points.unbind(-1)
+    return torch.stack(
+        (
+            cp[:, None] * x - sp[:, None] * z,
+            sr[:, None] * sp[:, None] * x + cr[:, None] * y + sr[:, None] * cp[:, None] * z,
+            cr[:, None] * sp[:, None] * x - sr[:, None] * y + cr[:, None] * cp[:, None] * z,
+        ),
+        dim=-1,
+    )
 
 
 ######################################################
@@ -160,6 +175,7 @@ class Go2NavEnv(DirectRLEnv):
         self._map_plot_counter = {}  # env_idx -> next file index
         self._ray_cache = {}
         self._load_perception_params()
+        self._init_lidar_extrinsics()
 
         self.tick_count_env: torch.Tensor = torch.zeros(N, device=self.device)
         self._step_count = 0
@@ -325,6 +341,23 @@ class Go2NavEnv(DirectRLEnv):
                 "pen_stagnation",
             ]
         }
+    def _init_lidar_extrinsics(self) -> None:
+        base_pos_w = self._robot.data.root_pos_w       # [N, 3]
+        base_quat_w = self._robot.data.root_quat_w     # [N, 4]
+
+        lidar_pos_w = self._height_scanner.data.pos_w   # [N, 3]
+        lidar_quat_w = self._height_scanner.data.quat_w # [N, 4]
+
+        q_w_base = quat_conjugate(base_quat_w)
+
+        # Rotation mapping scanner-frame vectors to base-frame vectors.
+        self._q_base_lidar = quat_mul(q_w_base, lidar_quat_w)
+
+        # Scanner origin expressed in the base frame.
+        self._t_base_lidar = quat_apply(
+            q_w_base,
+            lidar_pos_w - base_pos_w,
+        )
 
     def _load_perception_params(self):
         """Optional config entries (all have defaults, so the cfg file does not need to change)."""
@@ -397,7 +430,7 @@ class Go2NavEnv(DirectRLEnv):
         self.scene.sensors["height_scanner"] = self._height_scanner
         self._rots_yaw = torch.empty(self.num_envs, device=self.device)
         self._rots_roll = torch.empty(self.num_envs, device=self.device)
-        self._offsets = torch.empty(self.num_envs, device=self.device)
+        self._offsets = torch.empty(self.num_envs, 3, device=self.device)
         self._rots_yaw.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
         self._rots_roll.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
         self._offsets.uniform_(-self.cfg.max_offset, self.cfg.max_offset)
@@ -576,27 +609,43 @@ class Go2NavEnv(DirectRLEnv):
         self.nav_heightmap = nav_heightmap
         return nav_heightmap
 
-    def _build_map_scan(self) -> torch.Tensor:
-        """Emulated sensor output for the map: ray hits in the yaw-aligned body frame, [N, R, 4] = (x_b, y_b, z_rel, valid).
+    def _build_map_scan(self, randomize : bool, sim_rpy : bool) -> torch.Tensor:
+        """Return scanner hits in the estimated, gravity-aligned base frame."""
+        rays = self._rays_in_lidar_frame(randomize=randomize)   # = -(hit in lidar frame)
+        p_s = -rays                                          # hit relative to the scanner origin
+        num_envs, num_rays, _ = p_s.shape
+        q_base_lidar = self._q_base_lidar[:, None, :].expand(num_envs, num_rays, 4)
+        p_b = quat_apply(q_base_lidar.reshape(-1, 4), p_s.reshape(-1, 3)).reshape(num_envs, num_rays, 3)
+        p_b = p_b + self._t_base_lidar[:, None, :]
 
-        The simulator ray hits are rotated/translated with the TRUE pose only to emulate what a real scanner reports
-        in its own frame. Registration into the map is done later with the ESTIMATED pose.
-        """
-        hits = self._height_scanner.data.ray_hits_w
-        root_pos = self._robot.data.root_pos_w
-        yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
-        c = torch.cos(yaw)[:, None]
-        s = torch.sin(yaw)[:, None]
-        dx = hits[..., 0] - root_pos[:, None, 0]
-        dy = hits[..., 1] - root_pos[:, None, 1]
-        bx = c * dx + s * dy
-        by = -s * dx + c * dy
-        bz = hits[..., 2] - root_pos[:, None, 2]
-        valid = torch.isfinite(hits).all(dim=-1) & ((bx * bx + by * by) <= float(self.pp.map_scan_max_range) ** 2)
-        if self.cfg.randomize:
-            bz = bz + torch.randn_like(bz) * float(self.pp.map_scan_noise)
-        scan = torch.stack([bx, by, bz, valid.float()], dim=-1)
+        if sim_rpy:
+            w, x, y, z = self._robot.data.root_quat_w.unbind(dim=-1)
+            roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+            pitch = torch.asin(torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0))
+        else:
+            roll, pitch = self.odom_out[:, :2].unbind(dim=-1)
+
+        cr, sr = torch.cos(roll)[:, None], torch.sin(roll)[:, None]
+        cp, sp = torch.cos(pitch)[:, None], torch.sin(pitch)[:, None]
+        x_b, y_b, z_b = p_b.unbind(-1)
+        p_g = torch.stack(
+            [
+                cp * x_b + sp * sr * y_b + sp * cr * z_b,
+                cr * y_b - sr * z_b,
+                -sp * x_b + cp * sr * y_b + cp * cr * z_b,
+            ],
+            dim=-1,
+        )
+        x_b, y_b, z_rel = p_g.unbind(-1)
+
+        valid = torch.isfinite(p_g).all(dim=-1) & (
+            (x_b * x_b + y_b * y_b) <= float(self.pp.map_scan_max_range) ** 2
+        )
+        if randomize:
+            z_rel = z_rel + torch.randn_like(z_rel) * float(self.pp.map_scan_noise)
+        scan = torch.stack([x_b, y_b, z_rel, valid.float()], dim=-1)
         return torch.where(valid[..., None], scan, torch.zeros_like(scan))
+
 
     def _scan_to_cells(self, scan: torch.Tensor, pose: torch.Tensor):
         """
@@ -882,7 +931,8 @@ class Go2NavEnv(DirectRLEnv):
         self._build_nav_heightmap()
 
         # emulated body-frame scan for the map, delayed with the same lag as the other height buffers
-        scan = self._build_map_scan()
+        scan = self._build_map_scan(randomize=False, sim_rpy=False)
+
         if self.cfg.delay:
             scan = self._map_scan_delay_buffer.compute(scan)
 
@@ -1425,6 +1475,8 @@ class Go2NavEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         low_level_joint_targets = self._robot.data.default_joint_pos + self.cfg.locomotion_action_scale * self.loc_actions
         self._robot.set_joint_position_target(low_level_joint_targets)
+        # self._robot.set_joint_position_target(self._robot.data.default_joint_pos)
+        
 
     def _rel_hist(self, hist: torch.Tensor) -> torch.Tensor:
         """Express a start-frame position history [N, L, 3] relative to the estimated robot pose (robot frame)."""
@@ -1586,8 +1638,6 @@ class Go2NavEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        print(self.max_episode_length)
-        print(self.episode_length_buf)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         goal_distance = torch.linalg.norm(self.goal_pos_w[:, :2] - self._robot.data.root_pos_w[:, :2], dim=-1)
@@ -1612,7 +1662,6 @@ class Go2NavEnv(DirectRLEnv):
             plot = False
             for env_id in env_ids:
                 cond = env_id in self.vis_envs.tolist()
-                print(cond)
                 if cond:
                     plot = True
             if plot:
@@ -1702,7 +1751,7 @@ class Go2NavEnv(DirectRLEnv):
         self._rots_roll[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(
             -self.cfg.max_rot, self.cfg.max_rot
         )
-        self._offsets[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(
+        self._offsets[env_ids_tensor] = torch.empty(num_resets, 3, device=self.device).uniform_(
             -self.cfg.max_offset, self.cfg.max_offset
         )
 
@@ -1753,9 +1802,8 @@ class Go2NavEnv(DirectRLEnv):
     # HEIGHT SCAN (policy convention, unchanged for the frozen locomotion policy)
     #################################################################
 
-    def _apply_offset(self, height_map):
-        offset_shape = (self._offsets.shape[0],) + (1,) * (height_map.ndim - 1)
-        return height_map + self._offsets.view(offset_shape)
+    def _apply_offsets(self, points: torch.Tensor) -> torch.Tensor:
+        return points + self._offsets.unsqueeze(1)
 
     def _apply_yaw_rotation(self, points: torch.Tensor) -> torch.Tensor:
         angles = torch.deg2rad(self._rots_yaw).unsqueeze(-1)
@@ -1797,6 +1845,7 @@ class Go2NavEnv(DirectRLEnv):
         if randomize:
             rays_lidar = self._apply_yaw_rotation(rays_lidar)
             rays_lidar = self._apply_roll_rotation(rays_lidar)
+            rays_lidar = self._apply_offsets(rays_lidar)
         self._ray_cache[key] = rays_lidar
         return rays_lidar
 
@@ -1855,7 +1904,6 @@ class Go2NavEnv(DirectRLEnv):
         hit_mask = torch.isfinite(height_map)  # capture BEFORE the where() destroys it
         height_map = torch.where(hit_mask, -height_map, torch.zeros_like(height_map))
         if randomize:
-            height_map = self._apply_offset(height_map)
             height_map += (2.0 * torch.rand_like(height_map) - 1.0) * float(0.01)
         if apply_dropout:
             height_map, dropout_mask = self._zero_heightmap_cells(height_map, locomotion)
