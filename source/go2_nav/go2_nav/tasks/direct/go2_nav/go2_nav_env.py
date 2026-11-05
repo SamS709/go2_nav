@@ -823,7 +823,8 @@ class Go2NavEnv(DirectRLEnv):
         x: input for the model
         observed: a bool mask of the crop being 1 if var < threshold and 0 otherwise
         seen: same mask but ground truth info (around the ground truth position)
-        in: 
+        inb: parts of the true scan that are in bounds of the global true map
+        target: real heights cropped from self.map_seen_gt arout self._true_pose_s()
         """
 
         def sel(t):
@@ -931,7 +932,7 @@ class Go2NavEnv(DirectRLEnv):
         self._build_nav_heightmap()
 
         # emulated body-frame scan for the map, delayed with the same lag as the other height buffers
-        scan = self._build_map_scan(randomize=False, sim_rpy=False)
+        scan = self._build_map_scan(randomize=self.cfg.randomize, sim_rpy=False)
 
         if self.cfg.delay:
             scan = self._map_scan_delay_buffer.compute(scan)
