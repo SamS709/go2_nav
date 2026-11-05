@@ -296,6 +296,9 @@ class Go2NavEnv(DirectRLEnv):
         self._WH = self._Wc * self._Hc
         self._crop_n = int(self.pp.map_crop_cells)
         self._map_meas_var = float(self.pp.map_meas_std) ** 2
+        self._map_origin = torch.empty(N, 2, device=self.device)
+        self._map_origin[:, 0] = -0.5 * self._Wm
+        self._map_origin[:, 1] = -0.5 * self._Hm
 
         self.raw_map = torch.zeros(N, self._Wc, self._Hc, device=self.device)  # Kalman height, tile-relative z
         self._map_variance = torch.full_like(self.raw_map, 1.0e6)  # Kalman variance
@@ -594,6 +597,92 @@ class Go2NavEnv(DirectRLEnv):
         model = EgoMapDenoiser(in_channels=4, base_channels=32).to(self.device)
         model.train()
         return model
+    
+    @torch.no_grad()
+    def _maybe_shift_map_window(self) -> None:
+        """Move each environment's map window when its estimated robot approaches a border.
+
+        The map remains expressed in the original start frame. Only its storage origin
+        and tensor indices change.
+        """
+        scan_margin = int(math.ceil(float(self.pp.map_scan_max_range) / self._cs))
+        crop_margin = self._crop_n // 2 + 2
+
+        margin_x = min(max(scan_margin, crop_margin), max(1, self._Wc // 3))
+        margin_y = min(max(scan_margin, crop_margin), max(1, self._Hc // 3))
+
+        # Current robot position expressed in map-cell coordinates.
+        ix = torch.floor(
+            (self.pose_est[:, 0] - self._map_origin[:, 0]) / self._cs
+        ).long()
+        iy = torch.floor(
+            (self.pose_est[:, 1] - self._map_origin[:, 1]) / self._cs
+        ).long()
+
+        need_x = (ix < margin_x) | (ix >= self._Wc - margin_x)
+        need_y = (iy < margin_y) | (iy >= self._Hc - margin_y)
+        need_shift = need_x | need_y
+        
+
+        env_ids = torch.where(need_shift)[0]
+
+        for env_id in env_ids.tolist():
+            sx = int(ix[env_id].item() - self._Wc // 2) if need_x[env_id] else 0
+            sy = int(iy[env_id].item() - self._Hc // 2) if need_y[env_id] else 0
+
+            if sx == 0 and sy == 0:
+                continue
+
+            def shift_tensor_(tensor: torch.Tensor, fill_value: float | bool):
+                """Shift a [Wc,Hc] tensor; new cell (i,j) reads old cell (i+sx,j+sy)."""
+                if abs(sx) >= self._Wc or abs(sy) >= self._Hc:
+                    tensor[env_id].fill_(fill_value)
+                    return
+
+                if sx != 0:
+                    tensor[env_id] = torch.roll(
+                        tensor[env_id], shifts=-sx, dims=0
+                    )
+                    if sx > 0:
+                        tensor[env_id, -sx:, :] = fill_value
+                    else:
+                        tensor[env_id, :-sx, :] = fill_value
+
+                if sy != 0:
+                    tensor[env_id] = torch.roll(
+                        tensor[env_id], shifts=-sy, dims=1
+                    )
+                    if sy > 0:
+                        tensor[env_id, :, -sy:] = fill_value
+                    else:
+                        tensor[env_id, :, :-sy] = fill_value
+
+            # Preserve old observations in the overlapping region.
+            shift_tensor_(self.raw_map, 0.0)
+            shift_tensor_(self._map_variance, 1.0e6)
+            shift_tensor_(self.map_seen_gt, False)
+
+            # Update the storage origin in the fixed start frame.
+            self._map_origin[env_id, 0] += sx * self._cs
+            self._map_origin[env_id, 1] += sy * self._cs
+
+            # Scratch buffers should not contain data from the old indexing.
+            start = env_id * self._WH
+            end = start + self._WH
+            self._fuse_sum[start:end] = 0.0
+            self._fuse_cnt[start:end] = 0.0
+
+            # Ground-truth supervision must correspond to the new cell positions.
+            self._update_true_map(
+                torch.tensor([env_id], device=self.device, dtype=torch.long)
+            )
+            
+        self.extras.setdefault("log", {})
+        self.extras["log"].update({
+            "map/shift_rate": need_shift.float().mean(),
+            "map/mean_origin_x": self._map_origin[:, 0].mean(),
+            "map/mean_origin_y": self._map_origin[:, 1].mean(),
+        })
 
     def _build_nav_heightmap(self) -> torch.Tensor:
         """Policy-convention navigation grid (student_height_scan). Not used for map placement anymore."""
@@ -648,22 +737,43 @@ class Go2NavEnv(DirectRLEnv):
 
 
     def _scan_to_cells(self, scan: torch.Tensor, pose: torch.Tensor):
-        """
-        Place body-frame points with ``pose`` ([N,4] start frame). Returns (env_idx, global_flat_cell_idx, height).
-        From scan in robot's frame to heightmap in start frame.
+        """Place body-frame points into the rolling map.
+
+        pose is expressed in the original start frame.
         """
         N = scan.shape[0]
         valid = scan[..., 3] > 0.5
+
         c = torch.cos(pose[:, 3])[:, None]
         s = torch.sin(pose[:, 3])[:, None]
+
         x = pose[:, 0, None] + c * scan[..., 0] - s * scan[..., 1]
         y = pose[:, 1, None] + s * scan[..., 0] + c * scan[..., 1]
-        ix = torch.floor((x + 0.5 * self._Wm) / self._cs).long()
-        iy = torch.floor((y + 0.5 * self._Hm) / self._cs).long()
-        ok = valid & (ix >= 0) & (ix < self._Wc) & (iy >= 0) & (iy < self._Hc)
-        h = scan[..., 2] + (pose[:, 2] + self._base_z0)[:, None]  # tile-relative absolute height
+
+        origin = self._map_origin[:N]
+
+        ix = torch.floor(
+            (x - origin[:, 0, None]) / self._cs
+        ).long()
+
+        iy = torch.floor(
+            (y - origin[:, 1, None]) / self._cs
+        ).long()
+
+        ok = (
+            valid
+            & (ix >= 0) & (ix < self._Wc)
+            & (iy >= 0) & (iy < self._Hc)
+        )
+
+        h = scan[..., 2] + (
+            pose[:, 2] + self._base_z0[:N]
+        )[:, None]
+
         env = self.all_env_ids[:N, None].expand_as(ok)
+
         gflat = env * self._WH + ix * self._Hc + iy
+
         return env[ok], gflat[ok], h[ok]
 
     def _fuse(self, env: torch.Tensor, gflat: torch.Tensor, meas: torch.Tensor) -> None:
@@ -714,8 +824,13 @@ class Go2NavEnv(DirectRLEnv):
         by = scan[:, None, :, 1]
         x = pose[:, 0, None, None] + offs[None, :, 0, None] + c * bx - s * by  # [n,K,M]
         y = pose[:, 1, None, None] + offs[None, :, 1, None] + s * bx + c * by
-        ix = torch.floor((x + 0.5 * self._Wm) / self._cs).long()
-        iy = torch.floor((y + 0.5 * self._Hm) / self._cs).long()
+        origin = self._map_origin[ids]
+        ix = torch.floor(
+            (x - origin[:, None, None, 0]) / self._cs
+        ).long()
+        iy = torch.floor(
+            (y - origin[:, None, None, 1]) / self._cs
+        ).long()
         inb = (ix >= 0) & (ix < self._Wc) & (iy >= 0) & (iy < self._Hc)
         gidx = (ids[:, None, None] * self._WH + ix.clamp(0, self._Wc - 1) * self._Hc + iy.clamp(0, self._Hc - 1)).reshape(-1)
         m_h = self.raw_map.view(-1)[gidx].view(n, K, M)
@@ -798,19 +913,32 @@ class Go2NavEnv(DirectRLEnv):
 
     # ----- ego crops --------------------------------------------------------------------------
 
-    def _ego_grid(self, pose: torch.Tensor) -> torch.Tensor:
-        """
-        builds a normalized sampling grid for a square local map window centered at the robot, rotated according to its yaw
-        """
+    def _ego_grid(
+        self,
+        pose: torch.Tensor,
+        map_origin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build normalized sampling coordinates for the rolling global map."""
         n = self._crop_n
-        u = (torch.arange(n, device=self.device) - n / 2 + 0.5) * self._cs
+
+        u = (
+            torch.arange(n, device=self.device) - n / 2 + 0.5
+        ) * self._cs
+
         uu, vv = torch.meshgrid(u, u, indexing="ij")
+
         c = torch.cos(pose[:, 3])[:, None, None]
         s = torch.sin(pose[:, 3])[:, None, None]
+
         x = pose[:, 0, None, None] + c * uu - s * vv
         y = pose[:, 1, None, None] + s * uu + c * vv
-        # maps are [B, C, Wc(x), Hc(y)] -> grid[..., 0] indexes the last dim (y), grid[..., 1] the x dim
-        return torch.stack([y / (0.5 * self._Hm), x / (0.5 * self._Wm)], dim=-1)
+
+        # Convert start-frame coordinates to normalized map coordinates.
+        grid_x = 2.0 * (x - map_origin[:, 0, None, None]) / self._Wm - 1.0
+        grid_y = 2.0 * (y - map_origin[:, 1, None, None]) / self._Hm - 1.0
+
+        # grid_sample: last dimension indexes y, second-to-last indexes x.
+        return torch.stack([grid_y, grid_x], dim=-1)
 
     @staticmethod
     def _crop(maps: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
@@ -833,8 +961,9 @@ class Go2NavEnv(DirectRLEnv):
         est = sel(self.pose_est)
         tru = sel(self._true_pose_s())
         z0 = sel(self._base_z0)
-        g_est = self._ego_grid(est)
-        g_true = self._ego_grid(tru)
+        map_origin = sel(self._map_origin)
+        g_est = self._ego_grid(est, map_origin)
+        g_true = self._ego_grid(tru, map_origin)
 
         h = self._crop(sel(self.raw_map).unsqueeze(1), g_est)[:, 0]
         var = self._crop(sel(self._map_variance).unsqueeze(1), g_est)[:, 0]
@@ -939,6 +1068,7 @@ class Go2NavEnv(DirectRLEnv):
 
         self._push_pose_hists()
         nav_pose = self._gather_hist(self._pose_est_hist)
+        self._maybe_shift_map_window()
 
         # scan-to-map correction (complementary-filter loop closure)
         if bool(self.pp.scan_match) and (self._step_count % max(1, int(self.pp.match_period)) == 0):
@@ -969,29 +1099,54 @@ class Go2NavEnv(DirectRLEnv):
         self._student_map_obs[:, 1] = conf
 
     def _update_true_map(self, env_ids: torch.Tensor) -> None:
-        """True tile-relative heightfield sampled in the start frame (training target / teacher input)."""
+        """Sample the ground-truth terrain at the current rolling map cell positions."""
         n = env_ids.numel()
         gx, gy = self._global_heightfield.shape
         res = self._global_heightfield_res
         x_min = self._global_heightfield_x_min
         y_min = self._global_heightfield_y_min
 
+        # Cell centers in the original start frame.
+        origin = self._map_origin[env_ids]
+
+        ix = torch.arange(self._Wc, device=self.device, dtype=torch.float32)
+        iy = torch.arange(self._Hc, device=self.device, dtype=torch.float32)
+
+        lx, ly = torch.meshgrid(ix, iy, indexing="ij")
+
+        local_x = origin[:, 0, None, None] + (lx[None] + 0.5) * self._cs
+        local_y = origin[:, 1, None, None] + (ly[None] + 0.5) * self._cs
+
+        # Transform start-frame positions into world coordinates.
         yaw = self.start_yaw_w[env_ids]
         cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
-        wx = cos_y[:, None] * self._map_local_pts[None, :, 0] - sin_y[:, None] * self._map_local_pts[None, :, 1]
-        wy = sin_y[:, None] * self._map_local_pts[None, :, 0] + cos_y[:, None] * self._map_local_pts[None, :, 1]
-        world_x = wx + self.start_pos_w[env_ids, 0:1]
-        world_y = wy + self.start_pos_w[env_ids, 1:2]
 
-        gx_norm = (world_x - x_min) / (gx * res) * 2 - 1
-        gy_norm = (world_y - y_min) / (gy * res) * 2 - 1
-        sample_grid = torch.stack([gy_norm, gx_norm], dim=-1).reshape(n, self._Wc, self._Hc, 2)
-        field = self._global_heightfield.unsqueeze(0).unsqueeze(0).expand(n, 1, gx, gy)
+        wx = cos_y[:, None, None] * local_x - sin_y[:, None, None] * local_y
+        wy = sin_y[:, None, None] * local_x + cos_y[:, None, None] * local_y
 
-        sampled = F.grid_sample(field, sample_grid, mode="bilinear", padding_mode="border", align_corners=False)
-        # tile-relative heights, same convention as the fused map (pose z + nominal base height)
-        self.true_map[env_ids] = sampled.squeeze(1) - self._terrain.env_origins[env_ids, 2][:, None, None]
+        world_x = wx + self.start_pos_w[env_ids, 0, None, None]
+        world_y = wy + self.start_pos_w[env_ids, 1, None, None]
 
+        gx_norm = (world_x - x_min) / (gx * res) * 2.0 - 1.0
+        gy_norm = (world_y - y_min) / (gy * res) * 2.0 - 1.0
+
+        sample_grid = torch.stack([gy_norm, gx_norm], dim=-1)
+
+        field = self._global_heightfield[None, None].expand(n, 1, gx, gy)
+
+        sampled = F.grid_sample(
+            field,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+
+        self.true_map[env_ids] = (
+            sampled.squeeze(1)
+            - self._terrain.env_origins[env_ids, 2][:, None, None]
+        )
+        
     def _precompute_global_heightfield(self):
         if self._heightfield_ready:
             return
@@ -1453,6 +1608,9 @@ class Go2NavEnv(DirectRLEnv):
         # actions = [vxd, vyd, wzd]. prev_cmd_vel must be stored BEFORE overwriting cmd_vel (it was always equal before).
         self._ray_cache.clear()
         self.prev_cmd_vel.copy_(self.cmd_vel)
+        # mock_cmd = torch.zeros_like(actions)
+        # mock_cmd[:,0]=1.0
+        # self.cmd_vel.copy_(mock_cmd)
         self.cmd_vel.copy_(actions)
 
         # 1. Locomotion policy
@@ -1539,7 +1697,7 @@ class Go2NavEnv(DirectRLEnv):
 
         # ---- teacher map: true map, ego crop at the TRUE pose, heights relative to the true base z ----
         true_pose = self._true_pose_s()
-        teacher_map = self._crop(self.true_map.unsqueeze(1), self._ego_grid(true_pose))
+        teacher_map = self._crop(self.true_map.unsqueeze(1), self._ego_grid(true_pose, self._map_origin))
         teacher_map = teacher_map - (true_pose[:, 2] + self._base_z0)[:, None, None, None]
 
         return {
@@ -1735,6 +1893,8 @@ class Go2NavEnv(DirectRLEnv):
 
         self._update_goals(env_ids_tensor, False)
         self._update_starts(env_ids_tensor, False)
+        self._map_origin[env_ids_tensor, 0] = -0.5 * self._Wm
+        self._map_origin[env_ids_tensor, 1] = -0.5 * self._Hm
         self._update_true_map(env_ids_tensor)
 
         # ---- persistent map: the previous episode's map must not leak into the new one ----
@@ -2153,10 +2313,17 @@ class Go2NavEnv(DirectRLEnv):
                     dim[..., 3] = np.where(p["dim"].T, 0.65, 0.0)
                     ax.imshow(dim, origin="lower", aspect="equal")
                 if p.get("full"):
-                    ax.plot(true_pose[0] / self._cs + self._Wc / 2 - 0.5, true_pose[1] / self._cs + self._Hc / 2 - 0.5,
-                            "bx", markersize=10, markeredgewidth=2)
-                    ax.plot(est_pose[0] / self._cs + self._Wc / 2 - 0.5, est_pose[1] / self._cs + self._Hc / 2 - 0.5,
-                            "r+", markersize=12, markeredgewidth=2)
+                    origin = self._map_origin[env_idx].cpu().numpy()
+                    ax.plot(
+                        (true_pose[0] - origin[0]) / self._cs - 0.5,
+                        (true_pose[1] - origin[1]) / self._cs - 0.5,
+                        "bx", markersize=10, markeredgewidth=2,
+                    )
+                    ax.plot(
+                        (est_pose[0] - origin[0]) / self._cs - 0.5,
+                        (est_pose[1] - origin[1]) / self._cs - 0.5,
+                        "r+", markersize=12, markeredgewidth=2,
+                    )
                 ax.set_title(p["title"], fontsize=9)
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
