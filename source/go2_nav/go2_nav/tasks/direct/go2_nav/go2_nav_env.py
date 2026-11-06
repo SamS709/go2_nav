@@ -3,29 +3,27 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Go2 navigation environment.
+"""Go2 navigation environment (simulation shell).
 
-Frames used in this file
-------------------------
-* world        : Isaac Sim world frame.
-* start frame  : frame of the robot at the beginning of the episode (origin = spawn position, x = spawn heading).
-                 The persistent map, the goal and the position histories live in this frame.
-* true pose    : ground-truth pose in the start frame (``_true_pose_s``). Used ONLY for supervision, for the
-                 teacher observations and to emulate sensors (never fed to the student).
-* est pose     : ``self.pose_est`` = [x, y, z, yaw] in the start frame, produced by dead-reckoning the
-                 odometry network's body velocities and nudged by the scan-to-map correction.
-* body frame   : yaw-aligned frame attached to the robot (x forward, y left).
-* ego crop     : map window centred on the robot and rotated by its yaw (what the planner sees).
+This file only contains what is specific to the simulator: scene, sensor emulation (ray hits, noise, dropout, delays),
+ground truth, rewards, terminations, curriculum, goals / starts, maze path tables and debugging plots.
 
-New perception pipeline (per control step)
-------------------------------------------
-1. odom_model predicts [roll, pitch, v_body(3), w_body(3)] from delayed proprioception.
-2. Dead-reckoning outside the network gives ``pose_est`` (and ``pose_dr`` = same without corrections, for metrics).
-3. The height scanner's ray hits are expressed in the body frame (ideal sensor), delayed, and placed in the
-   start-frame map with the pose that was valid at capture time.
-4. Optional scan-to-map matching nudges ``pose_est`` (complementary-filter style loop closure).
-5. A per-cell Kalman filter fuses the placed points into ``raw_map`` / ``_map_variance``.
-6. An ego-centric crop of the fused map is denoised/completed by ``EgoMapDenoiser`` and given to the planner.
+The deployable logic lives in the Isaac-free package ``go2_perception``:
+
+    self.loc     LocomotionController  frozen TorchScript policy + obs/action bookkeeping
+    self.odom    OdometryEstimator     GRU attitude/velocity + dead-reckoning + pose / position histories
+    self.mapper  MapPerception         rolling Kalman map, scan-to-map matching, ego-crop denoiser
+
+and ``sim_support.SimMapSupervisor`` (``self.sim_gt``) provides the ground truth used only for supervision
+(training targets, fog of war, teacher map).
+
+Frames: world | start frame (origin = spawn, x = spawn heading; map, goal and histories live here) |
+est pose (``self.odom.pose_est`` = [x, y, z, yaw]) | body (yaw-aligned) | ego crop (map window rotated by the yaw).
+
+Per control step:
+ 1. locomotion policy on the (noisy, delayed) proprioception + height grid
+ 2. odometry network -> dead-reckoning
+ 3. map: build scan -> (delay) -> shift window -> scan matching -> Kalman fusion -> ego crop -> denoiser
 """
 
 from __future__ import annotations
@@ -33,133 +31,25 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Sequence
-from types import SimpleNamespace
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from tensordict import TensorDict
 
 import isaaclab.sim as sim_utils
-from isaaclab.sensors import ContactSensor, RayCaster
-from isaaclab.assets import Articulation, RigidObject
-import isaaclab.utils.math as math_utils
+from isaaclab.sensors import ContactSensor
+from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils.buffers import DelayBuffer
-from isaaclab.terrains import TerrainImporterCfg, TerrainImporter
+
+from .go2_perception import HeightGrid, LocomotionController, MapPerception, OdometryEstimator, PerceptionParams
+from .go2_perception.math_utils import quat_to_roll_pitch, quat_to_yaw, wrap_to_pi
 
 from .go2_nav_env_cfg import Go2NavEnvCfg
-from go2_nav.maze_terrain_cfg import MeshMazeTerrainCfg, MAZE_REGISTRY
+from go2_nav.maze_terrain_cfg import MAZE_REGISTRY
 from .utils import env_ids_to_terrain_coords
 from .networks.cnn_rnn_model import CNNRNNSeqModel  # noqa: F401  (kept: may be needed for model registration)
-from rsl_rl.models.rnn_model import RNNModel
-
-
-def rotate_roll_pitch(points: torch.Tensor, roll: torch.Tensor, pitch: torch.Tensor) -> torch.Tensor:
-    """Undo roll and pitch so body-frame points are expressed in a level body frame."""
-    cr, sr = torch.cos(roll), torch.sin(roll)
-    cp, sp = torch.cos(pitch), torch.sin(pitch)
-    x, y, z = points.unbind(-1)
-    return torch.stack(
-        (
-            cp[:, None] * x - sp[:, None] * z,
-            sr[:, None] * sp[:, None] * x + cr[:, None] * y + sr[:, None] * cp[:, None] * z,
-            cr[:, None] * sp[:, None] * x - sr[:, None] * y + cr[:, None] * cp[:, None] * z,
-        ),
-        dim=-1,
-    )
-
-
-######################################################
-# SMALL HELPER MODULES
-######################################################
-
-
-class EgoMapDenoiser(nn.Module):
-    """Spatial denoiser / completer working on an ego-centric crop of the fused map.
-
-    Input  [B, 4, n, n]: (height relative to the robot * observed, normalised log-variance, observed mask,
-                          1/(1+var) confidence).
-    Output [B, 2, n, n]: (height residual, log-variance of the residual). The environment builds
-                          ``pred_height = input_height + residual`` (residual head, zero-initialised, so the
-                          network starts as the identity on the Kalman estimate).
-
-    U-Net with two stride-2 downsamplings, a dilated bottleneck (dilation 2 and 4; the receptive field covers
-    roughly the whole 64x64 crop) and GroupNorm. No recurrence, no odometry, no geometry.
-    """
-
-    def __init__(self, in_channels: int = 4, base_channels: int = 32, groups: int = 8):
-        super().__init__()
-
-        def block(cin, cout, stride=1, dilation=1):
-            return nn.Sequential(
-                nn.Conv2d(cin, cout, 3, stride=stride, padding=dilation, dilation=dilation),
-                nn.GroupNorm(min(groups, cout), cout),
-                nn.ELU(),
-            )
-
-        b = base_channels
-        self.enc1 = block(in_channels, b)
-        self.enc2 = block(b, 2 * b, stride=2)
-        self.enc3 = block(2 * b, 4 * b, stride=2)
-        self.bottleneck = nn.Sequential(block(4 * b, 4 * b, dilation=2), block(4 * b, 4 * b, dilation=4))
-        self.up2 = nn.ConvTranspose2d(4 * b, 2 * b, 2, stride=2)
-        self.dec2 = block(4 * b, 2 * b)
-        self.up1 = nn.ConvTranspose2d(2 * b, b, 2, stride=2)
-        self.dec1 = block(2 * b, b)
-        self.head = nn.Conv2d(b, 2, 1)
-        nn.init.zeros_(self.head.weight)
-        with torch.no_grad():
-            self.head.bias.copy_(torch.tensor([0.0, math.log(0.05**2)]))
-
-    @staticmethod
-    def _match(up: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        if up.shape[-2:] != ref.shape[-2:]:
-            up = F.interpolate(up, size=ref.shape[-2:], mode="bilinear", align_corners=False)
-        return up
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-        b = self.bottleneck(e3)
-        d2 = self.dec2(torch.cat([self._match(self.up2(b), e2), e2], dim=1))
-        d1 = self.dec1(torch.cat([self._match(self.up1(d2), e1), e1], dim=1))
-        return self.head(d1)
-
-
-class _RunningNorm:
-    """Running mean/variance normaliser (Chan et al. parallel update). Used for the odometry inputs."""
-
-    def __init__(self, dim: int, device):
-        self.mean = torch.zeros(dim, device=device)
-        self.var = torch.ones(dim, device=device)
-        self.count = 1e-4
-
-    @torch.no_grad()
-    def update(self, x: torch.Tensor) -> None:
-        b_n = x.shape[0]
-        b_mean = x.mean(0)
-        b_var = x.var(0, unbiased=False)
-        delta = b_mean - self.mean
-        tot = self.count + b_n
-        self.mean = self.mean + delta * b_n / tot
-        m2 = self.var * self.count + b_var * b_n + delta**2 * self.count * b_n / tot
-        self.var = m2 / tot
-        self.count = tot
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return ((x - self.mean) / torch.sqrt(self.var + 1e-8)).clamp(-10.0, 10.0)
-
-    def state_dict(self) -> dict:
-        return {"mean": self.mean.clone(), "var": self.var.clone(), "count": float(self.count)}
-
-    def load_state_dict(self, sd: dict) -> None:
-        self.mean = sd["mean"].to(self.mean.device)
-        self.var = sd["var"].to(self.var.device)
-        self.count = float(sd["count"])
+from .sim_support import CellDropout, SimMapSupervisor
 
 
 class Go2NavEnv(DirectRLEnv):
@@ -174,20 +64,15 @@ class Go2NavEnv(DirectRLEnv):
         N = self.num_envs
         self._map_plot_counter = {}  # env_idx -> next file index
         self._ray_cache = {}
-        self._load_perception_params()
+        self.pp = PerceptionParams.from_cfg(self.cfg)
         self._init_lidar_extrinsics()
-
-        self.tick_count_env: torch.Tensor = torch.zeros(N, device=self.device)
-        self._step_count = 0
-        self.period_hist_short_term = max(1, int(round(1 / self.cfg.freq_pos_short_term)))
-        self.period_hist_long_term = max(1, int(round(1 / self.cfg.freq_pos_long_term)))
         self.all_env_ids: torch.Tensor = torch.arange(N, device=self.device)
 
-        self._base_id_sensor, _base_name = self._contact_sensor.find_bodies("base")
-        self._feet_ids_sensor, _feet_name = self._contact_sensor.find_bodies(".*_foot")
-        self._thigh_ids_sensor, _thigh_name = self._contact_sensor.find_bodies(".*_thigh")
-        self._hip_ids_sensor, _hip_name = self._contact_sensor.find_bodies(".*_hip")
-        self._calf_ids_sensor, _calf_name = self._contact_sensor.find_bodies(".*_calf")
+        self._base_id_sensor, _ = self._contact_sensor.find_bodies("base")
+        self._feet_ids_sensor, _ = self._contact_sensor.find_bodies(".*_foot")
+        self._thigh_ids_sensor, _ = self._contact_sensor.find_bodies(".*_thigh")
+        self._hip_ids_sensor, _ = self._contact_sensor.find_bodies(".*_hip")
+        self._calf_ids_sensor, _ = self._contact_sensor.find_bodies(".*_calf")
 
         self._base_id, _ = self._robot.find_bodies("base")
         self._feet_ids, _ = self._robot.find_bodies(".*_foot")
@@ -203,81 +88,47 @@ class Go2NavEnv(DirectRLEnv):
         )
 
         MAZE_REGISTRY.set_dims(
-            self.cfg.NUM_ROWS,
-            self.cfg.NUM_COLS,
-            self.cfg.MAX_MAZE_ROWS,
-            self.cfg.MAX_MAZE_COLS,
-            self.device,
+            self.cfg.NUM_ROWS, self.cfg.NUM_COLS, self.cfg.MAX_MAZE_ROWS, self.cfg.MAX_MAZE_COLS, self.device
         )
         self.maze_registery = MAZE_REGISTRY
         self._build_maze_path_tables()
 
-        # ---------------- odometry state ----------------
-        # network output: [roll, pitch, vx_b, vy_b, vz_b, wx_b, wy_b, wz_b]
-        self.odom_out: torch.Tensor = torch.zeros(N, 8, device=self.device)
-        self._prev_vel_b = torch.zeros(N, 3, device=self.device)
-        self._prev_yaw_rate = torch.zeros(N, device=self.device)
-        # estimated pose in the start frame: [x, y, z, yaw]
-        self.pose_est: torch.Tensor = torch.zeros(N, 4, device=self.device)
-        # dead-reckoning only (no scan-to-map correction) -> metrics
-        self.pose_dr: torch.Tensor = torch.zeros(N, 4, device=self.device)
-        self._drift_dist = torch.zeros(N, device=self.device)  # distance travelled since last accepted correction
-        self._gyro_bias = torch.zeros(N, 3, device=self.device)
-        self.odom_obs_proprio_hist = torch.zeros(N, int(self.cfg.length_odom_hist), 45, device=self.device)
-
         self.cmd_vel: torch.Tensor = torch.zeros(N, 3, device=self.device)
         self.prev_cmd_vel: torch.Tensor = torch.zeros_like(self.cmd_vel)
         self._num_joints = int(self._robot.data.default_joint_pos.shape[-1])
-        self.loc_actions: torch.Tensor = torch.zeros(N, self._num_joints, device=self.device)
-        self.prev_loc_actions: torch.Tensor = torch.zeros_like(self.loc_actions)
-
-        self.pred_pos_hist_short_term = torch.zeros(N, int(self.cfg.length_short_term), 3, device=self.device)
-        self.pred_pos_hist_long_term = torch.zeros(N, int(self.cfg.length_long_term), 3, device=self.device)
 
         # nominal base height above ground (tile-relative z of the base at spawn)
         self._base_z0 = self._robot.data.default_root_state[:, 2].clone()
 
-        # ---------------- delay buffers ----------------
+        # ---------------- sensor delay buffers (sim emulation of latency) ----------------
         self._proprio_lag = self._sample_lag(N)
-        self._height_lag = self._sample_lag(N)  # shared by every height-sensor buffer and by the pose history
+        self._height_lag = self._sample_lag(N)  # shared by every height-sensor buffer and by the pose histories
         if self.cfg.delay:
-            self._proprio_delay_buffer = DelayBuffer(
-                history_length=self.cfg.delay_length, batch_size=N, device=self.device
-            )
-            self._loc_heightmap_delay_buffer = DelayBuffer(
-                history_length=self.cfg.delay_length, batch_size=N, device=self.device
-            )
-            self._nav_heightmap_delay_buffer = DelayBuffer(
-                history_length=self.cfg.delay_length, batch_size=N, device=self.device
-            )
-            self._map_scan_delay_buffer = DelayBuffer(
-                history_length=self.cfg.delay_length, batch_size=N, device=self.device
-            )
+            mk = lambda: DelayBuffer(history_length=self.cfg.delay_length, batch_size=N, device=self.device)
+            self._proprio_delay_buffer = mk()
+            self._loc_heightmap_delay_buffer = mk()
+            self._nav_heightmap_delay_buffer = mk()
+            self._map_scan_delay_buffer = mk()
             self._proprio_delay_buffer.set_time_lag(self._proprio_lag.clone())
-            for buf in (
-                self._loc_heightmap_delay_buffer,
-                self._nav_heightmap_delay_buffer,
-                self._map_scan_delay_buffer,
-            ):
+            for buf in self._height_delay_buffers:
                 buf.set_time_lag(self._height_lag.clone())
-
-        # pose histories (index 0 = latest) so that a delayed scan is placed with the pose of its capture time
-        self._hist_len = int(self.cfg.delay_length) + 1 if self.cfg.delay else 1
-        self._pose_est_hist = torch.zeros(N, self._hist_len, 4, device=self.device)
-        self._pose_true_hist = torch.zeros(N, self._hist_len, 4, device=self.device)
 
         self._init_goals_and_starts()
         self._finite_warn_counter = 0
 
-        # ---------------- learned models ----------------
-        self.locomotion_policy = self._load_locomotion_policy()
-        self._train_perception = bool(self.pp.train_perception)
-        self.odom_model = self._load_odom_model()
-        self.odom_norm = _RunningNorm(45 * int(self.cfg.length_odom_hist), self.device)
-        self.odom_optimizer = torch.optim.Adam(self.odom_model.parameters(), lr=float(self.pp.odom_lr))
-        self.map_model = self._load_map_model()
-        self.map_optimizer = torch.optim.Adam(self.map_model.parameters(), lr=float(self.pp.map_lr))
-        self._maybe_load_perception(self.pp.perception_checkpoint)
+        # ---------------- deployable modules ----------------
+        train = bool(self.pp.train.train_perception)
+        self.loc = LocomotionController(
+            self.cfg.locomotion_policy_path, N, self._num_joints, self.cfg.locomotion_action_scale, self.device
+        )
+        self.odom = OdometryEstimator(N, self.device, self.pp.odom, self.step_dt, train=train, lr=self.pp.train.odom_lr)
+        self.mapper = MapPerception(
+            N, self.device, self.pp, self._base_z0, self._q_base_lidar, self._t_base_lidar, train=train
+        )
+        self.sim_gt = SimMapSupervisor(self, self.mapper.map)  # sim only
+        self._maybe_load_perception(self.pp.train.checkpoint)
+
+        self.nav_heightmap = torch.zeros(N, 2, self.nav_grid.x_cells, self.nav_grid.y_cells, device=self.device)
 
         self.terrain_success_rate = torch.zeros(
             self.cfg.terrain.terrain_generator.num_rows,
@@ -287,49 +138,8 @@ class Go2NavEnv(DirectRLEnv):
         self.terrain_episode_count = torch.zeros_like(self.terrain_success_rate)
         self._stall_counter = torch.zeros(N, device=self.device)
 
-        # ---------------- persistent start-frame map ----------------
-        self._cs = float(self.cfg.map_cell_size)
-        self._Wc = int(round(float(self.cfg.map_width) / self._cs))
-        self._Hc = int(round(float(self.cfg.map_height) / self._cs))
-        self._Wm = self._Wc * self._cs
-        self._Hm = self._Hc * self._cs
-        self._WH = self._Wc * self._Hc
-        self._crop_n = int(self.pp.map_crop_cells)
-        self._map_meas_var = float(self.pp.map_meas_std) ** 2
-        self._map_origin = torch.empty(N, 2, device=self.device)
-        self._map_origin[:, 0] = -0.5 * self._Wm
-        self._map_origin[:, 1] = -0.5 * self._Hm
-
-        self.raw_map = torch.zeros(N, self._Wc, self._Hc, device=self.device)  # Kalman height, tile-relative z
-        self._map_variance = torch.full_like(self.raw_map, 1.0e6)  # Kalman variance
-        self.true_map = torch.zeros_like(self.raw_map)  # simulator heightfield in the start frame
-        self.map_seen_gt = torch.zeros(N, self._Wc, self._Hc, dtype=torch.bool, device=self.device)
-        self._fuse_sum = torch.zeros(N * self._WH, device=self.device)
-        self._fuse_cnt = torch.zeros(N * self._WH, device=self.device)
-        self.nav_heightmap = torch.zeros(N, 2, self.nav_x_cells, self.nav_y_cells, device=self.device)
-        # planner map observation (ego crop): [height relative to robot, confidence]
-        self._student_map_obs = torch.zeros(N, 2, self._crop_n, self._crop_n, device=self.device)
-
-        local_x = (torch.arange(self._Wc, device=self.device) - self._Wc / 2 + 0.5) * self._cs
-        local_y = (torch.arange(self._Hc, device=self.device) - self._Hc / 2 + 0.5) * self._cs
-        lx, ly = torch.meshgrid(local_x, local_y, indexing="ij")
-        self._map_local_pts = torch.stack([lx, ly], dim=-1).reshape(-1, 2)  # (cells, 2), env-independent
-
-        # scan matching offsets (start-frame dx, dy, dyaw)
-        sx, sy, sa = int(self.pp.match_xy_steps), int(self.pp.match_xy_steps), int(self.pp.match_yaw_steps)
-        assert sx % 2 == 1 and sa % 2 == 1, "match_xy_steps and match_yaw_steps must be odd"
-        ox = torch.linspace(-float(self.pp.match_xy_range), float(self.pp.match_xy_range), sx, device=self.device)
-        oy = torch.linspace(-float(self.pp.match_xy_range), float(self.pp.match_xy_range), sy, device=self.device)
-        yaw_r = math.radians(float(self.pp.match_yaw_range_deg))
-        oa = torch.linspace(-yaw_r, yaw_r, sa, device=self.device)
-        gx, gy, ga = torch.meshgrid(ox, oy, oa, indexing="ij")
-        self._match_offs = torch.stack([gx, gy, ga], dim=-1).reshape(-1, 3)
-        self._match_shape = (sx, sy, sa)
-        self._match_zero_idx = (sx // 2) * sy * sa + (sy // 2) * sa + sa // 2
-        self._match_idx = None
-        self._match_idx_R = -1
-
-        print(f"Global map initialized with shape: {tuple(self.raw_map.shape)}, ego crop: {self._crop_n}x{self._crop_n}")
+        m = self.mapper.map
+        print(f"Global map initialized with shape: {tuple(m.raw_map.shape)}, ego crop: {m.crop_n}x{m.crop_n}")
         self._episode_sums = {
             key: torch.zeros(N, dtype=torch.float, device=self.device)
             for key in [
@@ -344,65 +154,21 @@ class Go2NavEnv(DirectRLEnv):
                 "pen_stagnation",
             ]
         }
+
+    @property
+    def _height_delay_buffers(self):
+        """Buffers fed by the height sensor (same physical sensor -> same lag)."""
+        return (self._nav_heightmap_delay_buffer, self._loc_heightmap_delay_buffer, self._map_scan_delay_buffer)
+
     def _init_lidar_extrinsics(self) -> None:
-        base_pos_w = self._robot.data.root_pos_w       # [N, 3]
-        base_quat_w = self._robot.data.root_quat_w     # [N, 4]
-
-        lidar_pos_w = self._height_scanner.data.pos_w   # [N, 3]
-        lidar_quat_w = self._height_scanner.data.quat_w # [N, 4]
-
+        base_pos_w = self._robot.data.root_pos_w
+        base_quat_w = self._robot.data.root_quat_w
+        lidar_pos_w = self._height_scanner.data.pos_w
+        lidar_quat_w = self._height_scanner.data.quat_w
         q_w_base = quat_conjugate(base_quat_w)
-
-        # Rotation mapping scanner-frame vectors to base-frame vectors.
+        # Rotation mapping scanner-frame vectors to base-frame vectors, and scanner origin in the base frame.
         self._q_base_lidar = quat_mul(q_w_base, lidar_quat_w)
-
-        # Scanner origin expressed in the base frame.
-        self._t_base_lidar = quat_apply(
-            q_w_base,
-            lidar_pos_w - base_pos_w,
-        )
-
-    def _load_perception_params(self):
-        """Optional config entries (all have defaults, so the cfg file does not need to change)."""
-        defaults = dict(
-            # models / training
-            train_perception=True,  # False -> odom and map models are frozen (inference only)
-            odom_lr=1e-3,
-            map_lr=1e-3,
-            perception_checkpoint=None,  # path written by save_perception_models()
-            # odometry
-            gyro_bias_max=0.01,  # rad/s, per-episode random gyro bias used by the yaw integrator (needs cfg.randomize)
-            # map scan / Kalman map
-            map_crop_cells=64,
-            map_scan_noise=0.01,  # m, z noise added to the emulated scan (needs cfg.randomize)
-            map_scan_max_range=6.0,  # m, ray hits farther than this (in xy) are ignored
-            map_meas_std=0.05,  # m, per-hit height standard deviation
-            map_min_variance=1e-4,  # variance floor, lets the map keep adapting to new measurements
-            map_observed_var_thresh=1.0,  # cell counts as "observed" below this variance (prior is 1e6)
-            map_drift_var_gain=0.02,  # m of height std added per metre travelled since the last correction
-            map_conf_ref_std=0.1,  # m, std at which the planner confidence equals 0.5
-            map_w_complete=0.5,  # loss weight for seen-but-unobserved cells
-            map_w_unseen=0.05,  # loss weight for never-seen cells
-            # scan-to-map matching
-            scan_match=True,
-            match_period=2,
-            match_xy_range=0.2,
-            match_xy_steps=5,
-            match_yaw_range_deg=3.0,
-            match_yaw_steps=5,
-            match_max_points=256,
-            match_chunk=128,
-            match_var_thresh=0.05,
-            match_min_points=40,
-            match_err_clip=9.0,
-            match_improve_thresh=0.3,
-            match_axis_obs_thresh=0.5,
-            match_gain=0.5,
-            match_gain_z=0.5,
-        )
-        for key in list(defaults.keys()):
-            defaults[key] = getattr(self.cfg, key, defaults[key])
-        self.pp = SimpleNamespace(**defaults)
+        self._t_base_lidar = quat_apply(q_w_base, lidar_pos_w - base_pos_w)
 
     def _sample_lag(self, n: int) -> torch.Tensor:
         if int(self.cfg.delay_length) <= 0:
@@ -437,8 +203,18 @@ class Go2NavEnv(DirectRLEnv):
         self._rots_yaw.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
         self._rots_roll.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
         self._offsets.uniform_(-self.cfg.max_offset, self.cfg.max_offset)
-        self._setup_lidar_values()
-        self._create_dropout_distributions()
+
+        # height grids (policy convention) and sim-only cell dropout
+        self.nav_grid = HeightGrid(
+            self.cfg.nav_x_range, self.cfg.nav_y_range, self.cfg.nav_cell_size, self.cfg.desired_base_height, self.device
+        )
+        self.loc_grid = HeightGrid(
+            self.cfg.loc_x_range, self.cfg.loc_y_range, self.cfg.loc_cell_size, self.cfg.desired_base_height, self.device
+        )
+        self.dropout = CellDropout(
+            self.loc_grid, self.nav_grid, self.cfg.sigma, self.cfg.n_zeros, self.cfg.max_reset_zeros_freq, self.device
+        )
+
         if self.cfg.vis:
             self.goal_markers = VisualizationMarkers(self.cfg.goal_marker_cfg)
             self.start_markers = VisualizationMarkers(self.cfg.start_marker_cfg)
@@ -456,82 +232,29 @@ class Go2NavEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
-        # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=10000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-        self._heightfield_ready = False
-
-    def _setup_lidar_values(self):
-        self.nav_inv_cell_size = 1.0 / float(self.cfg.nav_cell_size)
-        self.nav_x_cells = max(
-            1, int((float(self.cfg.nav_x_range[1]) - float(self.cfg.nav_x_range[0])) * self.nav_inv_cell_size)
-        )
-        self.nav_y_cells = max(
-            1, int((float(self.cfg.nav_y_range[1]) - float(self.cfg.nav_y_range[0])) * self.nav_inv_cell_size)
-        )
-        self.nav_num_cells = self.nav_x_cells * self.nav_y_cells
-        self._latest_lidar_obs = torch.zeros(self.num_envs, self.nav_num_cells, device=self.device)
-
-        self.loc_inv_cell_size = 1.0 / float(self.cfg.loc_cell_size)
-        self.loc_x_cells = max(
-            1, int((float(self.cfg.loc_x_range[1]) - float(self.cfg.loc_x_range[0])) * self.loc_inv_cell_size)
-        )
-        self.loc_y_cells = max(
-            1, int((float(self.cfg.loc_y_range[1]) - float(self.cfg.loc_y_range[0])) * self.loc_inv_cell_size)
-        )
-        self.loc_num_cells = self.loc_x_cells * self.loc_y_cells
-
-    def _make_gaussian_prob(self, h: int, w: int) -> torch.Tensor:
-        """Same weighting as before (kept on purpose), but computed per grid and without float overflow."""
-        y = torch.arange(h, device=self.device, dtype=torch.float32)
-        x = torch.arange(w, device=self.device, dtype=torch.float32)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        cy = (h - 1) / 2.0
-        cx = (w - 1) / 2.0
-        expo = ((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * self.cfg.sigma**2)
-        prob = torch.exp(expo - expo.max())
-        return (prob / prob.sum()).flatten()
-
-    def _create_dropout_distributions(self):
-        """Cell-dropout distributions, one per grid (the nav grid has a different size than the loc grid)."""
-        self._drop_prob_loc = self._make_gaussian_prob(self.loc_x_cells, self.loc_y_cells)
-        self._drop_prob_nav = self._make_gaussian_prob(self.nav_x_cells, self.nav_y_cells)
-        self._n_zeros_loc = int(self.cfg.n_zeros)
-        self._n_zeros_nav = max(1, int(round(self.cfg.n_zeros * self.nav_num_cells / max(1, self.loc_num_cells))))
-        self._resample_dropout_indices()
-        self.same_zeros_count = 0
-        self.reset_zeros_freq = int(torch.randint(1, self.cfg.max_reset_zeros_freq + 1, (1,), device=self.device).item())
-
-    def _resample_dropout_indices(self):
-        self.sampled_indices_loc = torch.multinomial(self._drop_prob_loc, self._n_zeros_loc, replacement=True)
-        self.sampled_indices_nav = torch.multinomial(self._drop_prob_nav, self._n_zeros_nav, replacement=True)
 
     #################################################################
     # PERCEPTION CHECKPOINTS
     #################################################################
 
     def save_perception_models(self, path: str) -> None:
-        """Save odom model, odom input normaliser and map model (to pretrain once, then freeze)."""
+        """Odom model + input normaliser + map model (same file format as before; load it on the robot too)."""
         torch.save(
-            {
-                "odom": self.odom_model.state_dict(),
-                "odom_norm": self.odom_norm.state_dict(),
-                "map": self.map_model.state_dict(),
-            },
-            os.path.expanduser(path),
+            {**self.odom.checkpoint_state(), **self.mapper.checkpoint_state()}, os.path.expanduser(path)
         )
 
     def _maybe_load_perception(self, path) -> None:
         if not path:
             return
         ckpt = torch.load(os.path.expanduser(path), map_location=self.device)
-        self.odom_model.load_state_dict(ckpt["odom"])
-        self.odom_norm.load_state_dict(ckpt["odom_norm"])
-        self.map_model.load_state_dict(ckpt["map"])
-        print(f"[Go2NavEnv] Loaded perception checkpoint from {path} (train_perception={self._train_perception})")
+        self.odom.load_checkpoint_state(ckpt)
+        self.mapper.load_checkpoint_state(ckpt)
+        print(f"[Go2NavEnv] Loaded perception checkpoint from {path} (train_perception={self.pp.train.train_perception})")
 
     #################################################################
-    # POSE HISTORY / FRAMES
+    # SIM GROUND TRUTH
     #################################################################
 
     def _true_pose_s(self) -> torch.Tensor:
@@ -542,658 +265,145 @@ class Go2NavEnv(DirectRLEnv):
         x_s = c * delta_w[:, 0] + s * delta_w[:, 1]
         y_s = -s * delta_w[:, 0] + c * delta_w[:, 1]
         z_s = delta_w[:, 2]
-        yaw = self._wrap_to_pi(self._quat_to_yaw(self._robot.data.root_quat_w) - self.start_yaw_w)
+        yaw = wrap_to_pi(quat_to_yaw(self._robot.data.root_quat_w) - self.start_yaw_w)
         return torch.stack([x_s, y_s, z_s, yaw], dim=-1)
 
-    def _push_pose_hists(self) -> None:
-        self._pose_est_hist = torch.roll(self._pose_est_hist, 1, dims=1)
-        self._pose_est_hist[:, 0] = self.pose_est
-        self._pose_true_hist = torch.roll(self._pose_true_hist, 1, dims=1)
-        self._pose_true_hist[:, 0] = self._true_pose_s()
+    def _get_true_odom_s(self) -> torch.Tensor:
+        """Ground-truth [x, y, z, roll, pitch, yaw, v_b(3), w_b(3)] in the spawn frame."""
+        pose = self._true_pose_s()
+        roll_w, pitch_w = quat_to_roll_pitch(self._robot.data.root_quat_w)
+        rpy_s = torch.stack([roll_w, pitch_w, pose[:, 3]], dim=-1)
+        return torch.cat(
+            [pose[:, :3], rpy_s, self._robot.data.root_lin_vel_b, self._robot.data.root_ang_vel_b], dim=-1
+        ).clone()
 
-    def _gather_hist(self, hist: torch.Tensor) -> torch.Tensor:
-        """Retrive the pos delayed frome time_lag(set at reset) from hist"""
-        if not self.cfg.delay:
-            return hist[:, 0]
-        return hist[self.all_env_ids, self._height_lag]
+    def _odom_target(self) -> torch.Tensor:
+        t = self._get_true_odom_s()
+        return torch.cat([t[:, 3:5], t[:, 6:9], t[:, 9:12]], dim=-1)  # roll, pitch, v_b, w_b
 
-    @staticmethod
-    def _integrate_pose(pose, roll, pitch, v_b, yaw_rate, dt) -> torch.Tensor:
-        """Dead-reckon [x, y, z, yaw] from body velocity, roll/pitch and yaw rate (R = Rz(yaw) Ry(pitch) Rx(roll))."""
-        yaw = Go2NavEnv._wrap_to_pi(pose[:, 3] + yaw_rate * dt)
-        cp, sp = torch.cos(pitch), torch.sin(pitch)
-        cr, sr = torch.cos(roll), torch.sin(roll)
-        cy, sy = torch.cos(yaw), torch.sin(yaw)
-        vx, vy, vz = v_b[:, 0], v_b[:, 1], v_b[:, 2]
-        vwx = cy * cp * vx + (cy * sp * sr - sy * cr) * vy + (cy * sp * cr + sy * sr) * vz
-        vwy = sy * cp * vx + (sy * sp * sr + cy * cr) * vy + (sy * sp * cr - cy * sr) * vz
-        vwz = -sp * vx + cp * sr * vy + cp * cr * vz
-        return torch.stack([pose[:, 0] + vwx * dt, pose[:, 1] + vwy * dt, pose[:, 2] + vwz * dt, yaw], dim=-1)
+    def _log(self, d: dict) -> None:
+        self.extras.setdefault("log", {}).update(d)
 
-    def _dead_reckon(self) -> None:
-        """Integrate the odometry network output (outside the network) into pose_est / pose_dr."""
-        pred = self.odom_out
-        roll, pitch = pred[:, 0], pred[:, 1]
-        vel_b = pred[:, 2:5]
-        gyro = self.proprio_delayed[:, 0:3] + self._gyro_bias  # delayed, noisy, biased gyro (body frame)
-        cp = torch.cos(pitch).clamp(min=0.2)
-        yaw_rate = (torch.sin(roll) * gyro[:, 1] + torch.cos(roll) * gyro[:, 2]) / cp
-        # trapezoidal rule: the displacement over the last interval uses the mean of the previous and current estimate
-        v_mid = 0.5 * (self._prev_vel_b + vel_b)
-        w_mid = 0.5 * (self._prev_yaw_rate + yaw_rate)
-        dt = self.step_dt
-        prev_xy = self.pose_est[:, :2].clone()
-        self.pose_est.copy_(self._integrate_pose(self.pose_est, roll, pitch, v_mid, w_mid, dt))
-        self.pose_dr.copy_(self._integrate_pose(self.pose_dr, roll, pitch, v_mid, w_mid, dt))
-        self._drift_dist += torch.linalg.norm(self.pose_est[:, :2] - prev_xy, dim=-1)
-        self._prev_vel_b.copy_(vel_b)
-        self._prev_yaw_rate.copy_(yaw_rate)
+    def _log_pose_metrics(self) -> None:
+        true = self._true_pose_s()
+        est, dr = self.odom.pose_est, self.odom.pose_dr
+        self._log(
+            {
+                "odom/ate_xy_corrected": torch.linalg.norm(est[:, :2] - true[:, :2], dim=-1).mean(),
+                "odom/ate_xy_dead_reckoning": torch.linalg.norm(dr[:, :2] - true[:, :2], dim=-1).mean(),
+                "odom/yaw_err_corrected": wrap_to_pi(est[:, 3] - true[:, 3]).abs().mean(),
+                "odom/yaw_err_dead_reckoning": wrap_to_pi(dr[:, 3] - true[:, 3]).abs().mean(),
+                "odom/z_err_corrected": (est[:, 2] - true[:, 2]).abs().mean(),
+            }
+        )
 
     #################################################################
-    # MAP MODEL UTILS
+    # SENSOR EMULATION (rays -> height grids / map scan)
     #################################################################
 
-    def _load_map_model(self) -> torch.nn.Module:
-        model = EgoMapDenoiser(in_channels=4, base_channels=32).to(self.device)
-        model.train()
-        return model
-    
-    @torch.no_grad()
-    def _maybe_shift_map_window(self) -> None:
-        """Move each environment's map window when its estimated robot approaches a border.
+    def _apply_offsets(self, points: torch.Tensor) -> torch.Tensor:
+        return points + self._offsets.unsqueeze(1)
 
-        The map remains expressed in the original start frame. Only its storage origin
-        and tensor indices change.
-        """
-        scan_margin = int(math.ceil(float(self.pp.map_scan_max_range) / self._cs))
-        crop_margin = self._crop_n // 2 + 2
+    def _apply_yaw_rotation(self, points: torch.Tensor) -> torch.Tensor:
+        angles = torch.deg2rad(self._rots_yaw).unsqueeze(-1)
+        cos_a, sin_a = torch.cos(angles), torch.sin(angles)
+        x, y, z = points[..., 0], points[..., 1], points[..., 2]
+        return torch.stack((x * cos_a + z * sin_a, y, -x * sin_a + z * cos_a), dim=-1)
 
-        margin_x = min(max(scan_margin, crop_margin), max(1, self._Wc // 3))
-        margin_y = min(max(scan_margin, crop_margin), max(1, self._Hc // 3))
+    def _apply_roll_rotation(self, points: torch.Tensor) -> torch.Tensor:
+        angles = torch.deg2rad(self._rots_roll).unsqueeze(-1)
+        cos_a, sin_a = torch.cos(angles), torch.sin(angles)
+        x, y, z = points[..., 0], points[..., 1], points[..., 2]
+        return torch.stack((x, y * cos_a - z * sin_a, y * sin_a + z * cos_a), dim=-1)
 
-        # Current robot position expressed in map-cell coordinates.
-        ix = torch.floor(
-            (self.pose_est[:, 0] - self._map_origin[:, 0]) / self._cs
-        ).long()
-        iy = torch.floor(
-            (self.pose_est[:, 1] - self._map_origin[:, 1]) / self._cs
-        ).long()
+    def _rays_in_lidar_frame(self, randomize: bool) -> torch.Tensor:
+        """Ray hits in the lidar frame (policy convention = -(hit rel. to scanner)), cached per step."""
+        key = bool(randomize)
+        if key in self._ray_cache:
+            return self._ray_cache[key]
+        data = self._height_scanner.data
+        num_envs, num_rays, _ = data.ray_hits_w.shape
+        rays_rel_w = -data.ray_hits_w + data.pos_w.unsqueeze(1)
+        rays_lidar = quat_apply(
+            quat_conjugate(data.quat_w).unsqueeze(1).expand(num_envs, num_rays, 4).reshape(-1, 4),
+            rays_rel_w.reshape(-1, 3),
+        ).reshape(num_envs, num_rays, 3)
+        if randomize:
+            rays_lidar = self._apply_yaw_rotation(rays_lidar)
+            rays_lidar = self._apply_roll_rotation(rays_lidar)
+            rays_lidar = self._apply_offsets(rays_lidar)
+        self._ray_cache[key] = rays_lidar
+        return rays_lidar
 
-        need_x = (ix < margin_x) | (ix >= self._Wc - margin_x)
-        need_y = (iy < margin_y) | (iy >= self._Hc - margin_y)
-        need_shift = need_x | need_y
-        
-
-        env_ids = torch.where(need_shift)[0]
-
-        for env_id in env_ids.tolist():
-            sx = int(ix[env_id].item() - self._Wc // 2) if need_x[env_id] else 0
-            sy = int(iy[env_id].item() - self._Hc // 2) if need_y[env_id] else 0
-
-            if sx == 0 and sy == 0:
-                continue
-
-            def shift_tensor_(tensor: torch.Tensor, fill_value: float | bool):
-                """Shift a [Wc,Hc] tensor; new cell (i,j) reads old cell (i+sx,j+sy)."""
-                if abs(sx) >= self._Wc or abs(sy) >= self._Hc:
-                    tensor[env_id].fill_(fill_value)
-                    return
-
-                if sx != 0:
-                    tensor[env_id] = torch.roll(
-                        tensor[env_id], shifts=-sx, dims=0
-                    )
-                    if sx > 0:
-                        tensor[env_id, -sx:, :] = fill_value
-                    else:
-                        tensor[env_id, :-sx, :] = fill_value
-
-                if sy != 0:
-                    tensor[env_id] = torch.roll(
-                        tensor[env_id], shifts=-sy, dims=1
-                    )
-                    if sy > 0:
-                        tensor[env_id, :, -sy:] = fill_value
-                    else:
-                        tensor[env_id, :, :-sy] = fill_value
-
-            # Preserve old observations in the overlapping region.
-            shift_tensor_(self.raw_map, 0.0)
-            shift_tensor_(self._map_variance, 1.0e6)
-            shift_tensor_(self.map_seen_gt, False)
-
-            # Update the storage origin in the fixed start frame.
-            self._map_origin[env_id, 0] += sx * self._cs
-            self._map_origin[env_id, 1] += sy * self._cs
-
-            # Scratch buffers should not contain data from the old indexing.
-            start = env_id * self._WH
-            end = start + self._WH
-            self._fuse_sum[start:end] = 0.0
-            self._fuse_cnt[start:end] = 0.0
-
-            # Ground-truth supervision must correspond to the new cell positions.
-            self._update_true_map(
-                torch.tensor([env_id], device=self.device, dtype=torch.long)
-            )
-            
-        self.extras.setdefault("log", {})
-        self.extras["log"].update({
-            "map/shift_rate": need_shift.float().mean(),
-            "map/mean_origin_x": self._map_origin[:, 0].mean(),
-            "map/mean_origin_y": self._map_origin[:, 1].mean(),
-        })
+    def _height_image(self, grid: HeightGrid, locomotion: bool, randomize: bool, apply_dropout: bool):
+        """Height grid [N, X, Y] + valid mask, with the sim-only noise / dropout."""
+        rays = self._rays_in_lidar_frame(randomize)
+        height, hit = grid.compute(rays, noise=0.01 if randomize else 0.0)
+        valid = hit
+        if apply_dropout:
+            height, keep = self.dropout.apply(height, locomotion)
+            valid = hit & keep
+        return grid.to_image(height), grid.to_image(valid)
 
     def _build_nav_heightmap(self) -> torch.Tensor:
-        """Policy-convention navigation grid (student_height_scan). Not used for map placement anymore."""
-        height_data, valid = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize, locomotion=False
+        """Policy-convention navigation grid (student_height_scan)."""
+        height, valid = self._height_image(
+            self.nav_grid, locomotion=False, randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize
         )
-        height_data = height_data.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1])
-        valid = valid.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1])
-        height_data = self._sanitize_tensor(height_data, "height_data_nav", clamp_abs=10.0)
-        nav_heightmap = torch.stack([height_data, valid], dim=1)
+        height = self._sanitize_tensor(height, "height_data_nav", clamp_abs=10.0)
+        nav_heightmap = torch.stack([height, valid], dim=1)
         if self.cfg.delay:
             nav_heightmap = self._nav_heightmap_delay_buffer.compute(nav_heightmap)
         self.nav_heightmap = nav_heightmap
         return nav_heightmap
 
-    def _build_map_scan(self, randomize : bool, sim_rpy : bool) -> torch.Tensor:
-        """Return scanner hits in the estimated, gravity-aligned base frame."""
-        rays = self._rays_in_lidar_frame(randomize=randomize)   # = -(hit in lidar frame)
-        p_s = -rays                                          # hit relative to the scanner origin
-        num_envs, num_rays, _ = p_s.shape
-        q_base_lidar = self._q_base_lidar[:, None, :].expand(num_envs, num_rays, 4)
-        p_b = quat_apply(q_base_lidar.reshape(-1, 4), p_s.reshape(-1, 3)).reshape(num_envs, num_rays, 3)
-        p_b = p_b + self._t_base_lidar[:, None, :]
-
-        if sim_rpy:
-            w, x, y, z = self._robot.data.root_quat_w.unbind(dim=-1)
-            roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
-            pitch = torch.asin(torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0))
-        else:
-            roll, pitch = self.odom_out[:, :2].unbind(dim=-1)
-
-        cr, sr = torch.cos(roll)[:, None], torch.sin(roll)[:, None]
-        cp, sp = torch.cos(pitch)[:, None], torch.sin(pitch)[:, None]
-        x_b, y_b, z_b = p_b.unbind(-1)
-        p_g = torch.stack(
-            [
-                cp * x_b + sp * sr * y_b + sp * cr * z_b,
-                cr * y_b - sr * z_b,
-                -sp * x_b + cp * sr * y_b + cp * cr * z_b,
-            ],
-            dim=-1,
-        )
-        x_b, y_b, z_rel = p_g.unbind(-1)
-
-        valid = torch.isfinite(p_g).all(dim=-1) & (
-            (x_b * x_b + y_b * y_b) <= float(self.pp.map_scan_max_range) ** 2
-        )
-        if randomize:
-            z_rel = z_rel + torch.randn_like(z_rel) * float(self.pp.map_scan_noise)
-        scan = torch.stack([x_b, y_b, z_rel, valid.float()], dim=-1)
-        return torch.where(valid[..., None], scan, torch.zeros_like(scan))
-
-
-    def _scan_to_cells(self, scan: torch.Tensor, pose: torch.Tensor):
-        """Place body-frame points into the rolling map.
-
-        pose is expressed in the original start frame.
-        """
-        N = scan.shape[0]
-        valid = scan[..., 3] > 0.5
-
-        c = torch.cos(pose[:, 3])[:, None]
-        s = torch.sin(pose[:, 3])[:, None]
-
-        x = pose[:, 0, None] + c * scan[..., 0] - s * scan[..., 1]
-        y = pose[:, 1, None] + s * scan[..., 0] + c * scan[..., 1]
-
-        origin = self._map_origin[:N]
-
-        ix = torch.floor(
-            (x - origin[:, 0, None]) / self._cs
-        ).long()
-
-        iy = torch.floor(
-            (y - origin[:, 1, None]) / self._cs
-        ).long()
-
-        ok = (
-            valid
-            & (ix >= 0) & (ix < self._Wc)
-            & (iy >= 0) & (iy < self._Hc)
-        )
-
-        h = scan[..., 2] + (
-            pose[:, 2] + self._base_z0[:N]
-        )[:, None]
-
-        env = self.all_env_ids[:N, None].expand_as(ok)
-
-        gflat = env * self._WH + ix * self._Hc + iy
-
-        return env[ok], gflat[ok], h[ok]
-
-    def _fuse(self, env: torch.Tensor, gflat: torch.Tensor, meas: torch.Tensor) -> None:
-        """Vectorised per-cell Kalman update. Hits falling in the same cell are averaged first."""
-        if gflat.numel() == 0:
-            return
-        self._fuse_sum.scatter_add_(0, gflat, meas)
-        self._fuse_cnt.scatter_add_(0, gflat, torch.ones_like(meas))
-        cnt = self._fuse_cnt[gflat]
-        avg = self._fuse_sum[gflat] / cnt
-        prior_var = self._map_variance.view(-1)[gflat]
-        drift = self._drift_dist[env]
-        meas_var = (self._map_meas_var + (float(self.pp.map_drift_var_gain) * drift) ** 2) / cnt
-        gain = prior_var / (prior_var + meas_var)
-        prior_mean = self.raw_map.view(-1)[gflat]
-        # duplicated indices carry identical values, so the (non-deterministic) write order is irrelevant
-        self.raw_map.view(-1)[gflat] = prior_mean + gain * (avg - prior_mean)
-        self._map_variance.view(-1)[gflat] = ((1.0 - gain) * prior_var).clamp_min(float(self.pp.map_min_variance))
-        self._fuse_sum[gflat] = 0.0
-        self._fuse_cnt[gflat] = 0.0
-
-    # ----- scan-to-map matching ---------------------------------------------------------------
-
-    def _get_match_idx(self, num_rays: int) -> torch.Tensor:
-        if self._match_idx is None or self._match_idx_R != num_rays:
-            m = min(num_rays, int(self.pp.match_max_points))
-            self._match_idx = torch.linspace(0, num_rays - 1, m, device=self.device).round().long()
-            self._match_idx_R = num_rays
-        return self._match_idx
-
-    @torch.no_grad()
-    def _scan_match_chunk(self, scan: torch.Tensor, pose: torch.Tensor, ids: torch.Tensor):
-        """Score K candidate offsets of the scan against the already-known map cells (chi-square-like score).
-        
-        If dx, dy, dz, dyaw make a more consistent map, they are applied as a transformation
-
-        scan [n, M, 4] body frame, pose [n, 4] (delayed est pose), ids [n] env ids.
-        Returns correction [n, 4] = (dx, dy, dz, dyaw) in the start frame and a bool mask "xy/yaw accepted".
-        """
-        pp = self.pp
-        n, M, _ = scan.shape
-        offs = self._match_offs
-        K = offs.shape[0]
-        yaw = pose[:, 3, None] + offs[None, :, 2]  # [n,K]
-        c = torch.cos(yaw)[..., None]
-        s = torch.sin(yaw)[..., None]
-        bx = scan[:, None, :, 0]
-        by = scan[:, None, :, 1]
-        x = pose[:, 0, None, None] + offs[None, :, 0, None] + c * bx - s * by  # [n,K,M]
-        y = pose[:, 1, None, None] + offs[None, :, 1, None] + s * bx + c * by
-        origin = self._map_origin[ids]
-        ix = torch.floor(
-            (x - origin[:, None, None, 0]) / self._cs
-        ).long()
-        iy = torch.floor(
-            (y - origin[:, None, None, 1]) / self._cs
-        ).long()
-        inb = (ix >= 0) & (ix < self._Wc) & (iy >= 0) & (iy < self._Hc)
-        gidx = (ids[:, None, None] * self._WH + ix.clamp(0, self._Wc - 1) * self._Hc + iy.clamp(0, self._Hc - 1)).reshape(-1)
-        m_h = self.raw_map.view(-1)[gidx].view(n, K, M)
-        m_v = self._map_variance.view(-1)[gidx].view(n, K, M)
-        z = scan[:, None, :, 2] + (pose[:, 2] + self._base_z0[ids])[:, None, None]
-        valid = scan[:, None, :, 3] > 0.5
-        known = inb & valid & (m_v < float(pp.match_var_thresh))
-
-        w = known.float() / (m_v + self._map_meas_var)
-        mu = (w * (z - m_h)).sum(-1) / w.sum(-1).clamp(min=1e-9)  # per-candidate mean height error (z drift)
-        resid = z - m_h - mu[..., None]  # z is decoupled from the xy/yaw search
-        clip = float(pp.match_err_clip)
-        err = (resid**2 / (m_v + self._map_meas_var)).clamp(max=clip)
-        nk = known.sum(-1)  # [n,K]
-        score = (err * known).sum(-1) / nk.clamp(min=1)
-        score = torch.where(nk >= int(pp.match_min_points), score, torch.full_like(score, clip))
-
-        sx, sy, sa = self._match_shape
-        S = score.reshape(n, sx, sy, sa)
-        best_score, best = score.min(dim=1)
-        zero_score = score[:, self._match_zero_idx]
-        nk_best = nk.gather(1, best[:, None]).squeeze(1)
-
-        # per-axis observability: the score profile along an axis (min over the others) must not be flat
-        thr = float(pp.match_axis_obs_thresh)
-        prof_x = S.amin(dim=(2, 3))
-        prof_y = S.amin(dim=(1, 3))
-        prof_a = S.amin(dim=(1, 2))
-        obs_x = (prof_x.amax(-1) - prof_x.amin(-1)) > thr
-        obs_y = (prof_y.amax(-1) - prof_y.amin(-1)) > thr
-        obs_a = (prof_a.amax(-1) - prof_a.amin(-1)) > thr
-
-        good = (
-            (nk_best >= int(pp.match_min_points))
-            & (best_score < clip * 0.999)
-            & ((zero_score - best_score) > float(pp.match_improve_thresh))
-        )
-        off = offs[best]  # [n,3]
-        gain = float(pp.match_gain)
-        dx = gain * off[:, 0] * obs_x.float() * good.float()
-        dy = gain * off[:, 1] * obs_y.float() * good.float()
-        dyaw = gain * off[:, 2] * obs_a.float() * good.float()
-
-        # z: take the mean height error at the chosen candidate if the xy match is trusted, else at zero offset
-        mu_best = mu.gather(1, best[:, None]).squeeze(1)
-        mu_zero = mu[:, self._match_zero_idx]
-        nk_zero = nk[:, self._match_zero_idx]
-        mu_sel = torch.where(good, mu_best, mu_zero)
-        z_ok = torch.where(good, nk_best, nk_zero) >= int(pp.match_min_points)
-        dz = -float(pp.match_gain_z) * mu_sel * z_ok.float()
-
-        corr = torch.stack([dx, dy, dz, dyaw], dim=-1)
-        accepted = good & (obs_x | obs_y | obs_a)
-        return corr, accepted
-
-    @torch.no_grad()
-    def _scan_match_all(self, scan: torch.Tensor, pose: torch.Tensor):
-        N = self.num_envs
-        sub = scan[:, self._get_match_idx(scan.shape[1])]
-        corr = torch.zeros(N, 4, device=self.device)
-        accepted = torch.zeros(N, dtype=torch.bool, device=self.device)
-        chunk = int(self.pp.match_chunk)
-        for start in range(0, N, chunk):
-            ids = self.all_env_ids[start : start + chunk]
-            c, a = self._scan_match_chunk(sub[ids], pose[ids], ids)
-            corr[ids] = c
-            accepted[ids] = a
-        return corr, accepted
-
-    @torch.no_grad()
-    def _apply_pose_correction(self, corr: torch.Tensor, accepted: torch.Tensor) -> None:
-        """Apply the same rigid nudge to the estimate, its history buffer and the position histories."""
-        self.pose_est += corr
-        self.pose_est[:, 3] = self._wrap_to_pi(self.pose_est[:, 3])
-        self._pose_est_hist += corr[:, None, :]
-        self._pose_est_hist[..., 3] = self._wrap_to_pi(self._pose_est_hist[..., 3])
-        self.pred_pos_hist_short_term += corr[:, None, 0:3]
-        self.pred_pos_hist_long_term += corr[:, None, 0:3]
-        self._drift_dist = torch.where(accepted, torch.zeros_like(self._drift_dist), self._drift_dist)
-
-    # ----- ego crops --------------------------------------------------------------------------
-
-    def _ego_grid(
-        self,
-        pose: torch.Tensor,
-        map_origin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build normalized sampling coordinates for the rolling global map."""
-        n = self._crop_n
-
-        u = (
-            torch.arange(n, device=self.device) - n / 2 + 0.5
-        ) * self._cs
-
-        uu, vv = torch.meshgrid(u, u, indexing="ij")
-
-        c = torch.cos(pose[:, 3])[:, None, None]
-        s = torch.sin(pose[:, 3])[:, None, None]
-
-        x = pose[:, 0, None, None] + c * uu - s * vv
-        y = pose[:, 1, None, None] + s * uu + c * vv
-
-        # Convert start-frame coordinates to normalized map coordinates.
-        grid_x = 2.0 * (x - map_origin[:, 0, None, None]) / self._Wm - 1.0
-        grid_y = 2.0 * (y - map_origin[:, 1, None, None]) / self._Hm - 1.0
-
-        # grid_sample: last dimension indexes y, second-to-last indexes x.
-        return torch.stack([grid_y, grid_x], dim=-1)
-
-    @staticmethod
-    def _crop(maps: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
-        return F.grid_sample(maps, grid, mode="nearest", padding_mode="zeros", align_corners=False)
-
-    @torch.no_grad()
-    def _compute_crops(self, ids: torch.Tensor | None = None) -> dict:
-        """Denoiser input (estimated pose) and training target / masks (true pose) for the given envs.
-        Returns {x, observed, seen, inb, target}
-        x: input for the model
-        observed: a bool mask of the crop being 1 if var < threshold and 0 otherwise
-        seen: same mask but ground truth info (around the ground truth position)
-        inb: parts of the true scan that are in bounds of the global true map
-        target: real heights cropped from self.map_seen_gt arout self._true_pose_s()
-        """
-
-        def sel(t):
-            return t if ids is None else t[ids]
-
-        est = sel(self.pose_est)
-        tru = sel(self._true_pose_s())
-        z0 = sel(self._base_z0)
-        map_origin = sel(self._map_origin)
-        g_est = self._ego_grid(est, map_origin)
-        g_true = self._ego_grid(tru, map_origin)
-
-        h = self._crop(sel(self.raw_map).unsqueeze(1), g_est)[:, 0]
-        var = self._crop(sel(self._map_variance).unsqueeze(1), g_est)[:, 0]
-        var = torch.where(var > 0.0, var, torch.full_like(var, 1.0e6))  # zero padding -> unobserved
-        observed = var < float(self.pp.map_observed_var_thresh)
-
-        z_est = (est[:, 2] + z0)[:, None, None]
-        rel = torch.where(observed, h, torch.zeros_like(h)) - z_est  # unobserved cells: flat-ground prior
-        logv = (torch.log(var.clamp(1e-6, 1e6)).clamp(-8.0, 14.0) + 5.0) / 5.0
-        conf_in = 1.0 / (1.0 + var)
-        x = torch.stack([rel, logv, observed.float(), conf_in], dim=1)
-
-        z_true = (tru[:, 2] + z0)[:, None, None]
-        target = self._crop(sel(self.true_map).unsqueeze(1), g_true)[:, 0] - z_true
-        seen = self._crop(sel(self.map_seen_gt).float().unsqueeze(1), g_true)[:, 0] > 0.5
-        inb = (g_true.abs() <= 1.0).all(dim=-1)
-        return {"x": x, "observed": observed, "seen": seen, "inb": inb, "target": target}
-
-    def _map_losses(self, pred_h, logvar, crops):
-        obs, seen, inb, target = crops["observed"], crops["seen"], crops["inb"], crops["target"]
-        pp = self.pp
-        w = obs.float() + (seen & ~obs).float() * float(pp.map_w_complete) + (~seen & ~obs).float() * float(pp.map_w_unseen)
-        w = w * inb.float()
-        err = pred_h - target
-        l1 = F.smooth_l1_loss(pred_h, target, reduction="none", beta=0.05)
-        loss_h = (w * l1).sum() / w.sum().clamp(min=1.0)
-
-        m = inb & (obs | seen)
-        mx = (m[:, 1:, :] & m[:, :-1, :]).float()
-        my = (m[:, :, 1:] & m[:, :, :-1]).float()
-        ex = ((pred_h[:, 1:, :] - pred_h[:, :-1, :]) - (target[:, 1:, :] - target[:, :-1, :])).abs()
-        ey = ((pred_h[:, :, 1:] - pred_h[:, :, :-1]) - (target[:, :, 1:] - target[:, :, :-1])).abs()
-        loss_e = 0.5 * ((mx * ex).sum() / mx.sum().clamp(min=1.0) + (my * ey).sum() / my.sum().clamp(min=1.0))
-
-        mm = m.float()
-        nll = 0.5 * (logvar + err.detach() ** 2 * torch.exp(-logvar))
-        loss_n = (mm * nll).sum() / mm.sum().clamp(min=1.0)
-        loss = loss_h + 0.5 * loss_e + 0.1 * loss_n
-        return loss, loss_h, loss_e, loss_n
-
-    def _map_step(self, crops: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run (and optionally train) the denoiser. Returns (pred height relative to the robot, planner confidence)."""
-        if not self._train_perception:
-            with torch.no_grad():
-                self.map_model.eval()
-                out = self.map_model(crops["x"])
-                pred_h = crops["x"][:, 0] + out[:, 0]
-                logvar = out[:, 1].clamp(-10.0, 4.0)
-        else:
-            with torch.inference_mode(False), torch.enable_grad():
-                self.map_model.train()
-                c = {k: v.detach().clone() for k, v in crops.items()}
-                out = self.map_model(c["x"])
-                pred_h = c["x"][:, 0] + out[:, 0]
-                logvar = out[:, 1].clamp(-10.0, 4.0)
-                loss, loss_h, loss_e, loss_n = self._map_losses(pred_h, logvar, c)
-                self.map_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.map_model.parameters(), max_norm=1.0)
-                self.map_optimizer.step()
-                self.map_model.eval()
-                pred_h = pred_h.detach()
-                logvar = logvar.detach()
-            self.extras.setdefault("log", {})
-            self.extras["log"].update(
-                {
-                    "map/loss_total": loss.detach(),
-                    "map/loss_height": loss_h.detach(),
-                    "map/loss_edge": loss_e.detach(),
-                    "map/loss_nll": loss_n.detach(),
-                }
-            )
-        # evaluation metrics (robot-relative heights, so they include z drift)
-        with torch.no_grad():
-            obs_m = (crops["observed"] & crops["inb"]).float()
-            unobs_seen = (~crops["observed"] & crops["seen"] & crops["inb"]).float()
-            target = crops["target"]
-            raw_err = (crops["x"][:, 0] - target).abs()
-            pred_err = (pred_h - target).abs()
-            self.extras.setdefault("log", {})
-            self.extras["log"].update(
-                {
-                    "map/raw_mae_observed": (raw_err * obs_m).sum() / obs_m.sum().clamp(min=1.0),
-                    "map/pred_mae_observed": (pred_err * obs_m).sum() / obs_m.sum().clamp(min=1.0),
-                    "map/pred_mae_seen_unobserved": (pred_err * unobs_seen).sum() / unobs_seen.sum().clamp(min=1.0),
-                }
-            )
-        ref = float(self.pp.map_conf_ref_std)
-        conf = 1.0 / (1.0 + torch.exp(logvar) / ref**2)
-        return pred_h, conf
-
     def _update_map_perception(self) -> None:
-        """Steps 3-6 of the perception pipeline (see module docstring)."""
-        # student navigation grid (policy convention) -- unchanged semantics
+        # student navigation grid (policy convention)
         self._build_nav_heightmap()
 
-        # emulated body-frame scan for the map, delayed with the same lag as the other height buffers
-        scan = self._build_map_scan(randomize=self.cfg.randomize, sim_rpy=False)
-
+        # emulated body-frame scan (uses the ESTIMATED roll/pitch), delayed like the other height buffers
+        rays = self._rays_in_lidar_frame(self.cfg.randomize)
+        noise = float(self.pp.map.scan_noise) if self.cfg.randomize else 0.0
+        scan = self.mapper.build_scan(-rays, *self.odom.roll_pitch, noise_std=noise)
         if self.cfg.delay:
             scan = self._map_scan_delay_buffer.compute(scan)
 
-        self._push_pose_hists()
-        nav_pose = self._gather_hist(self._pose_est_hist)
-        self._maybe_shift_map_window()
+        self.sim_gt.push_true_pose(self._true_pose_s())
+        lag = self._height_lag if self.cfg.delay else None
+        self.mapper.update(scan, self.odom, lag=lag, supervisor=self.sim_gt)
+        self._log(self.mapper.last_log)
 
-        # scan-to-map correction (complementary-filter loop closure)
-        if bool(self.pp.scan_match) and (self._step_count % max(1, int(self.pp.match_period)) == 0):
-            corr, accepted = self._scan_match_all(scan, nav_pose)
-            self._apply_pose_correction(corr, accepted)
-            nav_pose = self._gather_hist(self._pose_est_hist)
-            self.extras.setdefault("log", {})
-            self.extras["log"].update(
-                {
-                    "match/accept_rate": accepted.float().mean(),
-                    "match/mean_abs_dxy": corr[:, :2].abs().sum(-1).mean(),
-                    "match/mean_abs_dz": corr[:, 2].abs().mean(),
-                }
-            )
+    #################################################################
+    # LOCOMOTION OBSERVATIONS
+    #################################################################
 
-        # Kalman fusion with the estimated capture-time pose
-        env, gflat, h = self._scan_to_cells(scan, nav_pose)
-        self._fuse(env, gflat, h)
+    def _build_locomotion_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
+        base_ang_vel = self._robot.data.root_ang_vel_b
+        projected_gravity = self._robot.data.projected_gravity_b
+        joint_pos_rel = self._robot.data.joint_pos - self._robot.data.default_joint_pos
+        joint_vel = self._robot.data.joint_vel
 
-        # ground-truth fog of war (true capture-time pose) -- supervision only
-        _, gflat_t, _ = self._scan_to_cells(scan, self._gather_hist(self._pose_true_hist))
-        self.map_seen_gt.view(-1)[gflat_t] = True
-
-        # ego crop -> denoiser -> planner observation
-        crops = self._compute_crops()
-        pred_h, conf = self._map_step(crops)
-        self._student_map_obs[:, 0] = pred_h
-        self._student_map_obs[:, 1] = conf
-
-    def _update_true_map(self, env_ids: torch.Tensor) -> None:
-        """Sample the ground-truth terrain at the current rolling map cell positions."""
-        n = env_ids.numel()
-        gx, gy = self._global_heightfield.shape
-        res = self._global_heightfield_res
-        x_min = self._global_heightfield_x_min
-        y_min = self._global_heightfield_y_min
-
-        # Cell centers in the original start frame.
-        origin = self._map_origin[env_ids]
-
-        ix = torch.arange(self._Wc, device=self.device, dtype=torch.float32)
-        iy = torch.arange(self._Hc, device=self.device, dtype=torch.float32)
-
-        lx, ly = torch.meshgrid(ix, iy, indexing="ij")
-
-        local_x = origin[:, 0, None, None] + (lx[None] + 0.5) * self._cs
-        local_y = origin[:, 1, None, None] + (ly[None] + 0.5) * self._cs
-
-        # Transform start-frame positions into world coordinates.
-        yaw = self.start_yaw_w[env_ids]
-        cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
-
-        wx = cos_y[:, None, None] * local_x - sin_y[:, None, None] * local_y
-        wy = sin_y[:, None, None] * local_x + cos_y[:, None, None] * local_y
-
-        world_x = wx + self.start_pos_w[env_ids, 0, None, None]
-        world_y = wy + self.start_pos_w[env_ids, 1, None, None]
-
-        gx_norm = (world_x - x_min) / (gx * res) * 2.0 - 1.0
-        gy_norm = (world_y - y_min) / (gy * res) * 2.0 - 1.0
-
-        sample_grid = torch.stack([gy_norm, gx_norm], dim=-1)
-
-        field = self._global_heightfield[None, None].expand(n, 1, gx, gy)
-
-        sampled = F.grid_sample(
-            field,
-            sample_grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=False,
+        height, valid = self._height_image(
+            self.loc_grid, locomotion=True, randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize
         )
+        height = self._sanitize_tensor(height, "height_data_loc", clamp_abs=10.0)
+        grid = torch.stack([height, valid.float()], dim=1)
+        if self.cfg.delay:
+            grid = self._loc_heightmap_delay_buffer.compute(grid)
 
-        self.true_map[env_ids] = (
-            sampled.squeeze(1)
-            - self._terrain.env_origins[env_ids, 2][:, None, None]
+        r = float(self.cfg.randomize)
+        noisy = lambda x, a: x + (2.0 * torch.rand_like(x) - 1.0) * a * r
+        proprio_delayed = torch.cat(
+            [noisy(base_ang_vel, 0.1), noisy(projected_gravity, 0.05), noisy(joint_pos_rel, 0.01), noisy(joint_vel, 0.1)],
+            dim=-1,
         )
-        
-    def _precompute_global_heightfield(self):
-        if self._heightfield_ready:
-            return
-        from isaaclab.utils.warp import raycast_mesh
+        proprio_delayed = self._sanitize_tensor(proprio_delayed, "proprio_delayed", clamp_abs=50.0)
+        if self.cfg.delay:
+            proprio_delayed = self._proprio_delay_buffer.compute(proprio_delayed)
+        self.proprio_delayed = proprio_delayed
 
-        prim_path = self._height_scanner.cfg.mesh_prim_paths[0]
-        warp_mesh = self._height_scanner.meshes[prim_path]
-
-        gen_cfg = self.cfg.terrain.terrain_generator
-        tile_w, tile_l = gen_cfg.size
-
-        # Bounds from ALL terrain tiles (not from the env origins at the first reset), so that curriculum
-        # level changes never move an env outside the precomputed heightfield.
-        origins = getattr(self._terrain, "terrain_origins", None)
-        if origins is None:
-            origins = self._terrain.env_origins
-        origins = origins.reshape(-1, 3)
-        margin = 0.5 * max(tile_w, tile_l) + 2.0
-        x_min = origins[:, 0].min().item() - margin
-        x_max = origins[:, 0].max().item() + margin
-        y_min = origins[:, 1].min().item() - margin
-        y_max = origins[:, 1].max().item() + margin
-
-        res = float(self.cfg.map_cell_size)
-        gx = max(2, int(math.ceil((x_max - x_min) / res)))
-        gy = max(2, int(math.ceil((y_max - y_min) / res)))
-
-        # cell centres, consistent with grid_sample(align_corners=False)
-        xs = x_min + (torch.arange(gx, device=self.device, dtype=torch.float32) + 0.5) * res
-        ys = y_min + (torch.arange(gy, device=self.device, dtype=torch.float32) + 0.5) * res
-        grid_x, grid_y = torch.meshgrid(xs, ys, indexing="ij")
-
-        ray_starts = torch.stack(
-            [grid_x.reshape(-1), grid_y.reshape(-1), torch.full_like(grid_x.reshape(-1), 100.0)], dim=-1
-        ).unsqueeze(0)
-        ray_dirs = torch.zeros_like(ray_starts)
-        ray_dirs[..., 2] = -1.0
-
-        hits, *_ = raycast_mesh(ray_starts, ray_dirs, mesh=warp_mesh)
-        heights = hits[0, :, 2]
-        heights = torch.where(torch.isfinite(heights), heights, torch.zeros_like(heights))
-
-        self._global_heightfield = heights.reshape(gx, gy)
-        self._global_heightfield_res = res
-        self._global_heightfield_x_min = x_min
-        self._global_heightfield_y_min = y_min
-        self._heightfield_ready = True
+        proprio_loc = self.loc.build_obs(proprio_delayed, self.cmd_vel)
+        return self._sanitize_tensor(proprio_loc, "proprio_loc", clamp_abs=50.0), grid
 
     #################################################################
     # MAZE PATH TABLES
@@ -1371,7 +581,7 @@ class Go2NavEnv(DirectRLEnv):
         forward_progress = ((positions_w[:, :2] - robot_centers) * unit_direction).sum(dim=-1)
         forward_progress = forward_progress.clamp(min=-cell_size, max=cell_size)
         distance = cell_distance * cell_size - forward_progress
-        # direct Euclidean distance in METERS (before: divided by cell_size, which mixed units when cell_size != 1)
+        # direct Euclidean distance in METERS
         euclidean = torch.linalg.norm(self.goal_pos_w[:, :2] - positions_w[:, :2], dim=-1)
         same_cell = (robot_rows == goal_rows) & (robot_cols == goal_cols)
         distance = torch.where(same_cell, euclidean, distance)
@@ -1408,275 +618,54 @@ class Go2NavEnv(DirectRLEnv):
         return list(reversed(path))
 
     #################################################################
-    # ODOM MODEL UTILS
+    # DirectRLEnv API
     #################################################################
-
-    def _load_odom_model(self):
-        in_dim = 45 * int(self.cfg.length_odom_hist)
-        obs = TensorDict({"proprio": torch.randn(self.num_envs, in_dim)})
-        obs_groups = {"policy": ["proprio"]}
-        model = RNNModel(
-            obs=obs,
-            obs_groups=obs_groups,
-            obs_set="policy",
-            output_dim=8,  # [roll, pitch, vx_b, vy_b, vz_b, wx_b, wy_b, wz_b]
-            hidden_dims=(128, 128),
-            activation="elu",
-            obs_normalization=False,  # inputs are normalised by self.odom_norm (running statistics)
-            rnn_num_layers=1,
-            rnn_hidden_dim=64,
-            rnn_type="gru",
-        )
-        model = model.to(self.device)
-        model.eval()
-        model.reset()
-        with torch.no_grad():
-            model(TensorDict({"proprio": obs["proprio"].to(self.device)}, batch_size=[self.num_envs]))
-        print("Odom model")
-        print(model)
-        return model
-
-    def _update_odom_obs_history(self, odom_obs: torch.Tensor) -> None:
-        """Most recent frame at the end of the buffer."""
-        self.odom_obs_proprio_hist = torch.roll(self.odom_obs_proprio_hist, -1, 1)
-        self.odom_obs_proprio_hist[:, -1, :] = odom_obs
-
-    def _update_predicted_position_history(self, predicted_xyz: torch.Tensor) -> None:
-        """Position histories (estimated start-frame positions); most recent at the end of the buffer."""
-        should_update_mid = self.tick_count_env % self.period_hist_short_term == 0
-        rolled = torch.roll(self.pred_pos_hist_short_term, shifts=-1, dims=1)
-        rolled[:, -1, :] = predicted_xyz
-        self.pred_pos_hist_short_term = torch.where(should_update_mid[:, None, None], rolled, self.pred_pos_hist_short_term)
-
-        should_update_long = self.tick_count_env % self.period_hist_long_term == 0
-        rolled = torch.roll(self.pred_pos_hist_long_term, shifts=-1, dims=1)
-        rolled[:, -1, :] = predicted_xyz
-        self.pred_pos_hist_long_term = torch.where(should_update_long[:, None, None], rolled, self.pred_pos_hist_long_term)
-
-    def _get_true_odom_s(self) -> torch.Tensor:
-        """Ground-truth [x, y, z, roll, pitch, yaw, v_b(3), w_b(3)] in the spawn frame."""
-        root_quat_w = self._robot.data.root_quat_w
-        root_lin_vel = self._robot.data.root_lin_vel_b
-        root_ang_vel = self._robot.data.root_ang_vel_b
-        pose = self._true_pose_s()
-
-        w, x, y, z = root_quat_w.unbind(dim=-1)
-        roll_w = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
-        pitch_w = torch.asin(torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0))
-        rpy_s = torch.stack([roll_w, pitch_w, pose[:, 3]], dim=-1)
-        return torch.cat([pose[:, :3], rpy_s, root_lin_vel, root_ang_vel], dim=-1).clone()
-
-    def _odom_step(self, odom_obs: torch.Tensor) -> torch.Tensor:
-        """Odometry inference (+ online training when train_perception). Returns [N, 8]."""
-        if self._train_perception:
-            self.odom_norm.update(odom_obs)
-        x = self.odom_norm(odom_obs)
-
-        if not self._train_perception:
-            with torch.no_grad():
-                self.odom_model.eval()
-                pred = self.odom_model(TensorDict({"proprio": x}, batch_size=x.shape[:1]))
-            if isinstance(pred, (tuple, list)):
-                pred = pred[0]
-            return pred.to(self.device).detach()
-
-        t = self._get_true_odom_s()
-        target = torch.cat([t[:, 3:5], t[:, 6:9], t[:, 9:12]], dim=-1)  # roll, pitch, v_b, w_b
-        with torch.inference_mode(False), torch.enable_grad():
-            x = x.detach().clone()
-            target = target.detach().clone()
-            self.odom_model.train()
-            pred = self.odom_model(TensorDict({"proprio": x}, batch_size=x.shape[:1]))
-            if isinstance(pred, (tuple, list)):
-                pred = pred[0]
-            pred = pred.to(self.device)
-
-            rp_loss = F.mse_loss(pred[:, 0:2], target[:, 0:2])
-            lin_vel_loss = F.mse_loss(pred[:, 2:5], target[:, 2:5])
-            ang_vel_loss = F.mse_loss(pred[:, 5:8], target[:, 5:8])
-            loss = rp_loss + lin_vel_loss + 0.5 * ang_vel_loss
-
-            self.odom_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.odom_model.parameters(), max_norm=1.0)
-            self.odom_optimizer.step()
-            self.odom_model.detach_hidden_state()
-            self.odom_model.eval()
-
-        self.extras.setdefault("log", {})
-        self.extras["log"].update(
-            {
-                "odom/loss_total": loss.detach(),
-                "odom/loss_roll_pitch": rp_loss.detach(),
-                "odom/loss_lin_vel": lin_vel_loss.detach(),
-                "odom/loss_ang_vel": ang_vel_loss.detach(),
-            }
-        )
-        return pred.detach()
-
-    def _build_odom_observations(self) -> torch.Tensor:
-        # per-frame obs shape = 30 (delayed proprio) + 3 (cmd) + 12 (loc action) = 45
-        odom_obs = torch.cat([self.proprio_delayed.clone(), self.cmd_vel, self.loc_actions], dim=-1)
-        self._update_odom_obs_history(odom_obs)
-        return self.odom_obs_proprio_hist.reshape(self.num_envs, -1)
-
-    def _log_pose_metrics(self) -> None:
-        true = self._true_pose_s()
-        err = torch.linalg.norm(self.pose_est[:, :2] - true[:, :2], dim=-1)
-        err_dr = torch.linalg.norm(self.pose_dr[:, :2] - true[:, :2], dim=-1)
-        yaw_err = self._wrap_to_pi(self.pose_est[:, 3] - true[:, 3]).abs()
-        yaw_err_dr = self._wrap_to_pi(self.pose_dr[:, 3] - true[:, 3]).abs()
-        self.extras.setdefault("log", {})
-        self.extras["log"].update(
-            {
-                "odom/ate_xy_corrected": err.mean(),
-                "odom/ate_xy_dead_reckoning": err_dr.mean(),
-                "odom/yaw_err_corrected": yaw_err.mean(),
-                "odom/yaw_err_dead_reckoning": yaw_err_dr.mean(),
-                "odom/z_err_corrected": (self.pose_est[:, 2] - true[:, 2]).abs().mean(),
-            }
-        )
-
-    #################################################################
-    # LOCOMOTION MODEL UTILS
-    #################################################################
-
-    def _load_locomotion_policy(self):
-        resolved_path = os.path.expanduser(self.cfg.locomotion_policy_path)
-        if not os.path.isabs(resolved_path):
-            resolved_path = os.path.join(os.getcwd(), resolved_path)
-
-        if not os.path.isfile(resolved_path):
-            raise FileNotFoundError(
-                f"Could not find locomotion policy at '{resolved_path}'. "
-                "Set Go2NavEnvCfg.locomotion_policy_path to a valid TorchScript file."
-            )
-        policy = torch.jit.load(resolved_path, map_location=self.device)
-        policy.eval()
-        with torch.no_grad():
-            policy.hidden_state = torch.zeros(
-                1,
-                self.num_envs,
-                128,
-                dtype=policy.hidden_state.dtype,
-                device=policy.hidden_state.device,
-            )
-        return policy
-
-    def _query_locomotion_policy(self, locomotion_obs: torch.Tensor, height_data_loc: torch.Tensor) -> torch.Tensor:
-        with torch.inference_mode():
-            actions = self.locomotion_policy(locomotion_obs, [height_data_loc])
-        if isinstance(actions, (tuple, list)):
-            actions = actions[0]
-        return actions.to(self.device)
-
-    def _build_locomotion_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
-        base_ang_vel = self._robot.data.root_ang_vel_b
-        projected_gravity = self._robot.data.projected_gravity_b
-        joint_pos_rel = self._robot.data.joint_pos - self._robot.data.default_joint_pos
-        joint_vel = self._robot.data.joint_vel
-
-        height_data, valid = self._compute_height_data_from_cloud(
-            randomize=self.cfg.randomize, apply_dropout=self.cfg.randomize, locomotion=True
-        )
-        height_data = height_data.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1])
-        height_data = self._sanitize_tensor(height_data, "height_data_loc", clamp_abs=10.0)
-        valid = valid.view(self.num_envs, self.loc_x_cells, self.loc_y_cells).flip(dims=[1]).float()
-
-        grid = torch.stack([height_data, valid], dim=1)
-        if self.cfg.delay:
-            grid = self._loc_heightmap_delay_buffer.compute(grid)
-
-        proprio_delayed = torch.cat(
-            [
-                base_ang_vel + (2.0 * torch.rand_like(base_ang_vel) - 1.0) * float(0.1) * self.cfg.randomize,
-                projected_gravity + (2.0 * torch.rand_like(projected_gravity) - 1.0) * float(0.05) * self.cfg.randomize,
-                joint_pos_rel + (2.0 * torch.rand_like(joint_pos_rel) - 1.0) * float(0.01) * self.cfg.randomize,
-                joint_vel + (2.0 * torch.rand_like(joint_vel) - 1.0) * float(0.1) * self.cfg.randomize,
-            ],
-            dim=-1,
-        )
-        proprio_delayed = self._sanitize_tensor(proprio_delayed, "proprio_delayed", clamp_abs=50.0)
-        if self.cfg.delay:
-            proprio_delayed = self._proprio_delay_buffer.compute(proprio_delayed)
-        self.proprio_delayed = proprio_delayed
-        proprio_loc = torch.cat([proprio_delayed, self.cmd_vel, self.loc_actions], dim=-1)
-
-        return self._sanitize_tensor(proprio_loc, "proprio_loc", clamp_abs=50.0), grid
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        # actions = [vxd, vyd, wzd]. prev_cmd_vel must be stored BEFORE overwriting cmd_vel (it was always equal before).
+        # actions = [vxd, vyd, wzd]. prev_cmd_vel must be stored BEFORE overwriting cmd_vel.
         self._ray_cache.clear()
         self.prev_cmd_vel.copy_(self.cmd_vel)
-        # mock_cmd = torch.zeros_like(actions)
-        # mock_cmd[:,0]=1.0
-        # self.cmd_vel.copy_(mock_cmd)
         self.cmd_vel.copy_(actions)
 
         # 1. Locomotion policy
-        proprio_obs_loc, height_data_loc = self._build_locomotion_observations()
-        self.prev_loc_actions.copy_(self.loc_actions)
-        self.loc_actions.copy_(self._query_locomotion_policy(proprio_obs_loc, height_data_loc))
+        proprio_obs_loc, height_grid_loc = self._build_locomotion_observations()
+        self.loc.act(proprio_obs_loc, height_grid_loc)
 
         # 2. Odometry: network predicts attitude + body velocities, the pose is integrated outside the network
-        odom_obs = self._build_odom_observations()
-        self.odom_out.copy_(self._odom_step(odom_obs))
-        self._dead_reckon()
+        target = self._odom_target() if self.odom.train_enabled else None
+        self.odom.step(self.proprio_delayed, self.cmd_vel, self.loc.actions, target)
+        self._log(self.odom.last_log)
 
-        # 3. Map: placement with the estimated pose, scan-to-map correction, Kalman fusion, ego-crop denoising
+        # 3. Map: scan, scan-to-map correction, Kalman fusion, ego-crop denoising
         self._update_map_perception()
-        self._update_predicted_position_history(self.pose_est[:, :3])
+        self.odom.pos_hist.push(self.odom.pose_est[:, :3])  # after the correction
         self._log_pose_metrics()
 
-        self.tick_count_env += 1
-        self._step_count += 1
-
     def _apply_action(self) -> None:
-        low_level_joint_targets = self._robot.data.default_joint_pos + self.cfg.locomotion_action_scale * self.loc_actions
-        self._robot.set_joint_position_target(low_level_joint_targets)
-        # self._robot.set_joint_position_target(self._robot.data.default_joint_pos)
-        
-
-    def _rel_hist(self, hist: torch.Tensor) -> torch.Tensor:
-        """Express a start-frame position history [N, L, 3] relative to the estimated robot pose (robot frame)."""
-        d = hist[..., :2] - self.pose_est[:, None, :2]
-        c = torch.cos(self.pose_est[:, 3])[:, None]
-        s = torch.sin(self.pose_est[:, 3])[:, None]
-        return torch.stack(
-            [c * d[..., 0] + s * d[..., 1], -s * d[..., 0] + c * d[..., 1], hist[..., 2] - self.pose_est[:, None, 2]],
-            dim=-1,
-        )
+        self._robot.set_joint_position_target(self.loc.joint_targets(self._robot.data.default_joint_pos))
 
     def _get_observations(self) -> dict:
         self._ray_cache.clear()
-        height_data_teacher, valid_teacher = self._compute_height_data_from_cloud(
-            randomize=False, apply_dropout=False, locomotion=False
-        )
-        height_data_teacher = height_data_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1])
-        height_data_teacher = self._sanitize_tensor(height_data_teacher, "height_data_teacher", clamp_abs=10.0)
-        valid_teacher = valid_teacher.view(self.num_envs, self.nav_x_cells, self.nav_y_cells).flip(dims=[1])
-        height_data_teacher = torch.stack([height_data_teacher, valid_teacher], dim=1)
+        height_t, valid_t = self._height_image(self.nav_grid, locomotion=False, randomize=False, apply_dropout=False)
+        height_t = self._sanitize_tensor(height_t, "height_data_teacher", clamp_abs=10.0)
+        height_data_teacher = torch.stack([height_t, valid_t], dim=1)
 
         # ---- goal expressed in the ESTIMATED robot frame (goal is given in the start frame) ----
-        pose = self.pose_est
+        pose = self.odom.pose_est
         c = torch.cos(pose[:, 3])
         s = torch.sin(pose[:, 3])
         d = self._get_goal_pos_s() - pose[:, :2]
         goal_rel_xy = torch.stack([c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]], dim=-1)
-        goal_rel_yaw = self._wrap_to_pi(self._get_goal_yaw_s().squeeze(-1) - pose[:, 3]).unsqueeze(-1)
+        goal_rel_yaw = wrap_to_pi(self._get_goal_yaw_s().squeeze(-1) - pose[:, 3]).unsqueeze(-1)
 
-        pred_pos_hist_short_term = self._rel_hist(self.pred_pos_hist_short_term).reshape(self.num_envs, -1)
-        pred_pos_hist_long_term = self._rel_hist(self.pred_pos_hist_long_term).reshape(self.num_envs, -1)
-        vel = self.odom_out[:, [2, 3, 7]]  # predicted [vx_b, vy_b, wz_b]
+        hist_short, hist_long = self.odom.pos_hist.relative_to(pose)
+        vel = self.odom.student_vel  # predicted [vx_b, vy_b, wz_b]
 
-        student_proprio = torch.cat(
-            [goal_rel_xy, goal_rel_yaw, pred_pos_hist_short_term, pred_pos_hist_long_term, vel, self.cmd_vel],
-            dim=-1,
-        )
+        student_proprio = torch.cat([goal_rel_xy, goal_rel_yaw, hist_short, hist_long, vel, self.cmd_vel], dim=-1)
 
         true_odom = self._get_true_odom_s()
         goal_delta = self.goal_pos_w - self._robot.data.root_pos_w
-        yaw_error = self._wrap_to_pi(self.goal_yaw_w - self._quat_to_yaw(self._robot.data.root_quat_w))
+        yaw_error = wrap_to_pi(self.goal_yaw_w - quat_to_yaw(self._robot.data.root_quat_w))
         goal_heading = torch.stack((torch.sin(yaw_error), torch.cos(yaw_error)), dim=-1)
 
         terrain_coords: torch.Tensor = env_ids_to_terrain_coords(self.all_env_ids, self._terrain)
@@ -1684,9 +673,9 @@ class Go2NavEnv(DirectRLEnv):
         terrain_type = mazes[:, :, :, 0].long()
         maze_encoded = torch.nn.functional.one_hot(terrain_type, self.maze_registery.num_terrain_types)
         maze_remaining = mazes[:, :, :, 1:]
-        maze_encoded_flat = maze_encoded.reshape(self.num_envs, -1)
-        maze_remaining_flat = maze_remaining.reshape(self.num_envs, -1)
-        maze_features = torch.cat([maze_encoded_flat, maze_remaining_flat], dim=-1)
+        maze_features = torch.cat(
+            [maze_encoded.reshape(self.num_envs, -1), maze_remaining.reshape(self.num_envs, -1)], dim=-1
+        )
 
         teacher_proprio = torch.cat(
             [student_proprio.clone(), true_odom, goal_delta, goal_heading, maze_features], dim=-1
@@ -1695,15 +684,12 @@ class Go2NavEnv(DirectRLEnv):
         student_proprio = self._sanitize_tensor(student_proprio, "student_proprio", clamp_abs=100.0)
         teacher_proprio = self._sanitize_tensor(teacher_proprio, "teacher_proprio", clamp_abs=100.0)
 
-        # ---- teacher map: true map, ego crop at the TRUE pose, heights relative to the true base z ----
-        true_pose = self._true_pose_s()
-        teacher_map = self._crop(self.true_map.unsqueeze(1), self._ego_grid(true_pose, self._map_origin))
-        teacher_map = teacher_map - (true_pose[:, 2] + self._base_z0)[:, None, None, None]
+        teacher_map = self.sim_gt.teacher_map(self._true_pose_s())
 
         return {
             "student_proprio": student_proprio,
             "student_height_scan": self.nav_heightmap.clone(),
-            "student_map": self._student_map_obs.clone(),
+            "student_map": self.mapper.obs.clone(),
             "teacher_proprio": teacher_proprio,
             "teacher_height_scan": height_data_teacher,
             "teacher_map": teacher_map,
@@ -1726,8 +712,8 @@ class Go2NavEnv(DirectRLEnv):
         rew_goal_distance = torch.exp(-path_distance / max(1e-4, float(self.cfg.goal_distance_sigma)))
 
         # Yaw orientation penalty (only when the robot is close to the goal)
-        robot_yaw = self._quat_to_yaw(self._robot.data.root_quat_w)
-        yaw_error = self._wrap_to_pi(self.goal_yaw_w - robot_yaw)
+        robot_yaw = quat_to_yaw(self._robot.data.root_quat_w)
+        yaw_error = wrap_to_pi(self.goal_yaw_w - robot_yaw)
         pen_goal_orientation = torch.where(
             path_distance < 0.1,
             (0.1 - path_distance) * -torch.square(yaw_error) / float(self.cfg.goal_orientation_sigma),
@@ -1742,7 +728,7 @@ class Go2NavEnv(DirectRLEnv):
         # Time penalty
         pen_time_penalty = torch.ones_like(path_distance)
 
-        # Violent commands penalty (now really active: prev_cmd_vel is the previous command)
+        # Violent commands penalty
         pen_cmd_rate = torch.sum(torch.square(self.cmd_vel - self.prev_cmd_vel), dim=-1)
 
         # Commands bounds
@@ -1750,8 +736,7 @@ class Go2NavEnv(DirectRLEnv):
         cmd_bounds_high = torch.sum(
             torch.where(torch.abs(self.cmd_vel) >= 1.0, torch.abs(self.cmd_vel), 0.0), dim=-1
         )
-        # 2. Low translational command while still far from the goal (was: signed min over [vx, vy, wz], which
-        #    penalised every straight-line command because vy = wz = 0)
+        # 2. Low translational command while still far from the goal
         cmd_mag = torch.linalg.norm(self.cmd_vel[:, :2], dim=-1)
         low_cmd_penalty = torch.where(
             torch.logical_and(cmd_mag <= 0.2, path_distance > 0.1),
@@ -1800,7 +785,7 @@ class Go2NavEnv(DirectRLEnv):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         goal_distance = torch.linalg.norm(self.goal_pos_w[:, :2] - self._robot.data.root_pos_w[:, :2], dim=-1)
-        yaw_error = self._wrap_to_pi(self.goal_yaw_w - self._quat_to_yaw(self._robot.data.root_quat_w)).abs()
+        yaw_error = wrap_to_pi(self.goal_yaw_w - quat_to_yaw(self._robot.data.root_quat_w)).abs()
         self.goal_reached = (goal_distance < self.cfg.goal_reached_distance) & (yaw_error < self.cfg.goal_reached_yaw)
 
         net_contact_forces = self._contact_sensor.data.net_forces_w_history
@@ -1813,7 +798,7 @@ class Go2NavEnv(DirectRLEnv):
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
-        self._precompute_global_heightfield()
+        self.sim_gt.precompute_heightfield()
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
@@ -1828,8 +813,6 @@ class Go2NavEnv(DirectRLEnv):
         self._robot.reset(env_ids)
         move_up = None
         move_down = None
-        with torch.no_grad():
-            self.locomotion_policy.hidden_state[:, env_ids_tensor, :] = 0.0
         terrain_generator = self.cfg.terrain.terrain_generator
         if terrain_generator is not None and terrain_generator.curriculum:
             reached_goal = self.goal_reached[env_ids_tensor]
@@ -1849,17 +832,9 @@ class Go2NavEnv(DirectRLEnv):
 
         super()._reset_idx(env_ids_tensor)
 
-        odom_reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        odom_reset_mask[env_ids_tensor] = True
-        with torch.no_grad():
-            self.odom_model.reset(odom_reset_mask)
-
-        self.tick_count_env[env_ids_tensor] = 0
-
         if move_up is not None and move_down is not None:
             self._terrain.update_env_origins(env_ids_tensor, move_up, move_down)
-            # Curriculum changes terrain_levels, so environments may now refer to
-            # different maze layouts than when the lookup table was built.
+            # Curriculum changes terrain_levels -> maze layouts may have changed.
             self._build_maze_path_tables(env_ids_tensor)
 
         joint_pos = self._robot.data.default_joint_pos[env_ids]
@@ -1868,41 +843,21 @@ class Go2NavEnv(DirectRLEnv):
         default_root_state = self._robot.data.default_root_state[env_ids_tensor].clone()
         default_root_state[:, :3] += self._terrain.env_origins[env_ids_tensor]
 
-        # ---- odometry / pose state ----
-        self.odom_out[env_ids_tensor] = 0.0
-        self._prev_vel_b[env_ids_tensor] = 0.0
-        self._prev_yaw_rate[env_ids_tensor] = 0.0
-        self.pose_est[env_ids_tensor] = 0.0
-        self.pose_dr[env_ids_tensor] = 0.0
-        self._pose_est_hist[env_ids_tensor] = 0.0
-        self._pose_true_hist[env_ids_tensor] = 0.0
-        self._drift_dist[env_ids_tensor] = 0.0
-        self.odom_obs_proprio_hist[env_ids_tensor] = 0.0
-        bias_max = float(self.pp.gyro_bias_max) * float(self.cfg.randomize)
-        self._gyro_bias[env_ids_tensor] = (
-            (2.0 * torch.rand(env_ids_tensor.numel(), 3, device=self.device) - 1.0) * bias_max
-        )
-        self.pred_pos_hist_short_term[env_ids_tensor] = 0.0
-        self.pred_pos_hist_long_term[env_ids_tensor] = 0.0
+        # ---- deployable modules ----
+        self.loc.reset(env_ids_tensor)
+        self.odom.reset(env_ids_tensor, randomize=self.cfg.randomize)
         self.cmd_vel[env_ids_tensor] = 0.0
         self.prev_cmd_vel[env_ids_tensor] = 0.0
-        self.loc_actions[env_ids_tensor] = 0.0
-        self.prev_loc_actions[env_ids_tensor] = 0.0
         self.goal_reached[env_ids_tensor] = False
         self._stall_counter[env_ids_tensor] = 0.0
 
         self._update_goals(env_ids_tensor, False)
         self._update_starts(env_ids_tensor, False)
-        self._map_origin[env_ids_tensor, 0] = -0.5 * self._Wm
-        self._map_origin[env_ids_tensor, 1] = -0.5 * self._Hm
-        self._update_true_map(env_ids_tensor)
 
-        # ---- persistent map: the previous episode's map must not leak into the new one ----
-        self.raw_map[env_ids_tensor] = 0.0
-        self._map_variance[env_ids_tensor] = 1.0e6
-        self.map_seen_gt[env_ids_tensor] = False
+        # the previous episode's map must not leak into the new one; GT after the start poses changed
+        self.mapper.reset(env_ids_tensor)
+        self.sim_gt.reset(env_ids_tensor)
         self.nav_heightmap[env_ids_tensor] = 0.0
-        self._student_map_obs[env_ids_tensor] = 0.0
 
         # randomisation of the scan misalignment, per env
         num_resets = env_ids_tensor.numel()
@@ -1920,18 +875,13 @@ class Go2NavEnv(DirectRLEnv):
         if self.cfg.delay:
             ids_list = env_ids_tensor.tolist()
             self._proprio_delay_buffer.reset(ids_list)
-            self._nav_heightmap_delay_buffer.reset(ids_list)
-            self._loc_heightmap_delay_buffer.reset(ids_list)
-            self._map_scan_delay_buffer.reset(ids_list)
+            for buf in self._height_delay_buffers:
+                buf.reset(ids_list)
             self._proprio_lag[env_ids_tensor] = self._sample_lag(num_resets)
-            # height-sensor buffers (nav, loc, map scan) and the pose history share one lag: same physical sensor
+            # height-sensor buffers (nav, loc, map scan) and the pose histories share one lag: same physical sensor
             self._height_lag[env_ids_tensor] = self._sample_lag(num_resets)
             self._proprio_delay_buffer.set_time_lag(self._proprio_lag.clone())
-            for buf in (
-                self._nav_heightmap_delay_buffer,
-                self._loc_heightmap_delay_buffer,
-                self._map_scan_delay_buffer,
-            ):
+            for buf in self._height_delay_buffers:
                 buf.set_time_lag(self._height_lag.clone())
 
         root_state = torch.cat([self.start_pos_w[env_ids], self.start_quat_w[env_ids]], dim=-1)
@@ -1943,9 +893,7 @@ class Go2NavEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids_tensor)
 
         # ---- logging (keep the per-step odom/map/match metrics, they are not episodic) ----
-        kept = {
-            k: v for k, v in self.extras.get("log", {}).items() if k.startswith(("odom/", "map/", "match/"))
-        }
+        kept = {k: v for k, v in self.extras.get("log", {}).items() if k.startswith(("odom/", "map/", "match/"))}
         extras = dict()
         for key in self._episode_sums.keys():
             episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids_tensor])
@@ -1958,135 +906,6 @@ class Go2NavEnv(DirectRLEnv):
         extras["Episode_Termination/base_contact"] = torch.count_nonzero(self.reset_terminated[env_ids_tensor]).item()
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids_tensor]).item()
         self.extras["log"].update(extras)
-
-    #################################################################
-    # HEIGHT SCAN (policy convention, unchanged for the frozen locomotion policy)
-    #################################################################
-
-    def _apply_offsets(self, points: torch.Tensor) -> torch.Tensor:
-        return points + self._offsets.unsqueeze(1)
-
-    def _apply_yaw_rotation(self, points: torch.Tensor) -> torch.Tensor:
-        angles = torch.deg2rad(self._rots_yaw).unsqueeze(-1)
-        cos_angles = torch.cos(angles)
-        sin_angles = torch.sin(angles)
-        x_coord = points[..., 0]
-        y_coord = points[..., 1]
-        z_coord = points[..., 2]
-        rotated_x = x_coord * cos_angles + z_coord * sin_angles
-        rotated_z = -x_coord * sin_angles + z_coord * cos_angles
-        return torch.stack((rotated_x, y_coord, rotated_z), dim=-1)
-
-    def _apply_roll_rotation(self, points: torch.Tensor) -> torch.Tensor:
-        angles = torch.deg2rad(self._rots_roll).unsqueeze(-1)  # was self._rots (never defined)
-        cos_angles = torch.cos(angles)
-        sin_angles = torch.sin(angles)
-        x_coord = points[..., 0]
-        y_coord = points[..., 1]
-        z_coord = points[..., 2]
-        rotated_y = y_coord * cos_angles - z_coord * sin_angles
-        rotated_z = y_coord * sin_angles + z_coord * cos_angles
-        return torch.stack((x_coord, rotated_y, rotated_z), dim=-1)
-
-    def _rays_in_lidar_frame(self, randomize: bool) -> torch.Tensor:
-        """Ray hits in the lidar frame (policy convention), cached per step (loc, nav and teacher share them)."""
-        key = bool(randomize)
-        if key in self._ray_cache:
-            return self._ray_cache[key]
-        data = self._height_scanner.data
-        ray_hits_w = data.ray_hits_w
-        lidar_pos_w = data.pos_w
-        lidar_quat_w = data.quat_w
-        num_envs, num_rays, _ = ray_hits_w.shape
-        rays_rel_w = -ray_hits_w + lidar_pos_w.unsqueeze(1)
-        rays_lidar = quat_apply(
-            quat_conjugate(lidar_quat_w).unsqueeze(1).expand(num_envs, num_rays, 4).reshape(-1, 4),
-            rays_rel_w.reshape(-1, 3),
-        ).reshape(num_envs, num_rays, 3)
-        if randomize:
-            rays_lidar = self._apply_yaw_rotation(rays_lidar)
-            rays_lidar = self._apply_roll_rotation(rays_lidar)
-            rays_lidar = self._apply_offsets(rays_lidar)
-        self._ray_cache[key] = rays_lidar
-        return rays_lidar
-
-    def _compute_height_data_from_cloud(self, randomize: bool = False, apply_dropout: bool = True, locomotion: bool = True):
-        """Compute flattened heightmap in lidar frame using cfg x/y bounds and cell size."""
-        rays_lidar = self._rays_in_lidar_frame(randomize)
-        num_envs, num_rays, _ = rays_lidar.shape
-
-        if locomotion:
-            x_cells = self.loc_x_cells
-            y_cells = self.loc_y_cells
-            inv_cell_size = self.loc_inv_cell_size
-            x_min = float(self.cfg.loc_x_range[0])
-            y_min = float(self.cfg.loc_y_range[0])
-            num_cells = self.loc_num_cells
-        else:
-            x_cells = self.nav_x_cells
-            y_cells = self.nav_y_cells
-            inv_cell_size = self.nav_inv_cell_size
-            x_min = float(self.cfg.nav_x_range[0])
-            y_min = float(self.cfg.nav_y_range[0])
-            num_cells = self.nav_num_cells
-
-        rays_flat = rays_lidar.reshape(-1, 3)
-        env_ids = torch.arange(num_envs, device=self.device).unsqueeze(1).expand(num_envs, num_rays).reshape(-1)
-
-        valid = torch.isfinite(rays_flat).all(dim=1)
-        if not torch.any(valid):
-            return (
-                torch.zeros((num_envs, num_cells), device=self.device),
-                torch.zeros((num_envs, num_cells), dtype=torch.bool, device=self.device),
-            )
-
-        rays_valid = rays_flat[valid]
-        env_ids = env_ids[valid]
-
-        x_idx = torch.floor((rays_valid[:, 0] - x_min) * inv_cell_size).long()
-        y_idx = torch.floor((rays_valid[:, 1] - y_min) * inv_cell_size).long()
-        in_bounds = (x_idx >= 0) & (x_idx < x_cells) & (y_idx >= 0) & (y_idx < y_cells)
-        if not torch.any(in_bounds):
-            return (
-                torch.zeros((num_envs, num_cells), device=self.device),
-                torch.zeros((num_envs, num_cells), dtype=torch.bool, device=self.device),
-            )
-
-        x_idx = x_idx[in_bounds]
-        y_idx = y_idx[in_bounds]
-        env_ids = env_ids[in_bounds]
-        z_vals = rays_valid[in_bounds, 2]
-
-        # Flatten env and cell indexing into one reduce op.
-        flat_idx = env_ids * num_cells + x_idx * y_cells + y_idx
-        height_map = torch.full((num_envs * num_cells,), -torch.inf, device=self.device)
-        height_map.scatter_reduce_(0, flat_idx, z_vals, reduce="amax", include_self=True)
-        height_map = height_map.reshape(num_envs, num_cells) + self.cfg.desired_base_height
-        hit_mask = torch.isfinite(height_map)  # capture BEFORE the where() destroys it
-        height_map = torch.where(hit_mask, -height_map, torch.zeros_like(height_map))
-        if randomize:
-            height_map += (2.0 * torch.rand_like(height_map) - 1.0) * float(0.01)
-        if apply_dropout:
-            height_map, dropout_mask = self._zero_heightmap_cells(height_map, locomotion)
-            valid = hit_mask & dropout_mask
-        else:
-            valid = hit_mask
-        return height_map, valid
-
-    def _zero_heightmap_cells(self, height_map, locomotion: bool = True):
-        self.same_zeros_count += 1
-        if self.same_zeros_count == self.reset_zeros_freq:
-            self.reset_zeros_freq = int(
-                torch.randint(1, self.cfg.max_reset_zeros_freq + 1, (1,), device=self.device).item()
-            )
-            self.same_zeros_count = 0
-            self._resample_dropout_indices()
-        indices = self.sampled_indices_loc if locomotion else self.sampled_indices_nav
-        height_map_actor = height_map.clone()
-        valid = torch.ones_like(height_map, dtype=torch.bool)
-        height_map_actor[:, indices] = 0.0
-        valid[:, indices] = False
-        return height_map_actor, valid
 
     #################################################################
     # GOALS / STARTS
@@ -2106,157 +925,77 @@ class Go2NavEnv(DirectRLEnv):
         delta_yaw = self.goal_yaw_w - self.start_yaw_w
         return torch.atan2(torch.sin(delta_yaw), torch.cos(delta_yaw)).unsqueeze(-1)
 
-    def _update_goals(self, env_ids: torch.Tensor, center: bool = False) -> None:
-        """Update goal positions for the given envs.
-
-        If ``center`` is True, the goal is placed at the center of each env's maze. Otherwise, the goal is sampled
-        uniformly at random over the actual bounds of that env's maze.
-
-        Per-env maze row count follows the curriculum: terrain levels 0 and 1 both produce a 1-row maze, and
-        level k (k >= 2) produces a k-row maze, clamped to `maze_max_rows`. Column count is fixed (`maze_max_cols`).
-        """
-        terrain_generator = self.cfg.terrain.terrain_generator
-        maze_cfg = terrain_generator.sub_terrains["maze"]
+    def _sample_cell_positions(self, env_ids: torch.Tensor, center: bool):
+        """Random maze-cell-aligned (x, y) offsets (env frame) for goals / starts, plus the env origins."""
+        maze_cfg = self.cfg.terrain.terrain_generator.sub_terrains["maze"]
         cell_size = float(maze_cfg.cell_size)
-
         max_cols = max(1, int(round(maze_cfg.maze_max_cols)))
 
         terrain_coords = env_ids_to_terrain_coords(env_ids, self._terrain)
         maze_rows = self.maze_registery.get_num_rows(terrain_coords)
         maze_cols = torch.full_like(maze_rows, max_cols)
-
         maze_rows_f = maze_rows.to(dtype=torch.float32)
         maze_cols_f = maze_cols.to(dtype=torch.float32)
-
         x_extent = maze_rows_f * cell_size
         y_extent = maze_cols_f * cell_size
 
         if center:
-            goal_local_x = torch.zeros_like(x_extent)
-            goal_local_y = torch.zeros_like(y_extent)
+            local_x = torch.zeros_like(x_extent)
+            local_y = torch.zeros_like(y_extent)
         else:
-            x_min = -0.5 * x_extent
             x_min = torch.where(maze_rows_f % 2 == 1, -0.5 * x_extent, -0.5 * x_extent - cell_size)
             x_max = 0.5 * x_extent
             y_min = -0.5 * y_extent
             y_max = torch.where(maze_cols_f % 2 == 1, 0.5 * y_extent, 0.5 * y_extent + cell_size)
-
             u_x = torch.rand(len(env_ids), device=self.device)
             u_y = torch.rand(len(env_ids), device=self.device)
-            goal_local_x = x_min + u_x * (x_max - x_min)
-            goal_local_y = y_min + u_y * (y_max - y_min)
-            goal_local_x = torch.where(
-                goal_local_x >= 0.0,
-                (goal_local_x // cell_size) * cell_size,
-                (goal_local_x // cell_size + 1) * cell_size,
-            )
-            goal_local_y = torch.where(
-                goal_local_y >= 0.0,
-                (goal_local_y // cell_size) * cell_size,
-                (goal_local_y // cell_size + 1) * cell_size,
-            )
+            local_x = x_min + u_x * (x_max - x_min)
+            local_y = y_min + u_y * (y_max - y_min)
+            local_x = torch.where(local_x >= 0.0, (local_x // cell_size) * cell_size, (local_x // cell_size + 1) * cell_size)
+            local_y = torch.where(local_y >= 0.0, (local_y // cell_size) * cell_size, (local_y // cell_size + 1) * cell_size)
+        return local_x, local_y, self._terrain.env_origins[env_ids]
 
-        env_origins = self._terrain.env_origins[env_ids]
+    @staticmethod
+    def _yaw_to_quat_(quat: torch.Tensor, yaw: torch.Tensor) -> None:
+        quat[:, 0] = torch.cos(yaw / 2)  # w
+        quat[:, 1] = 0.0
+        quat[:, 2] = 0.0
+        quat[:, 3] = torch.sin(yaw / 2)  # z
 
-        self.goal_pos_w[env_ids, 0] = env_origins[:, 0] + goal_local_x
-        self.goal_pos_w[env_ids, 1] = env_origins[:, 1] + goal_local_y
+    def _visualize(self, markers, pos, quat) -> None:
+        if type(self.vis_envs) == int:
+            markers.visualize(translations=pos[self.vis_envs].unsqueeze(0), orientations=quat[self.vis_envs].unsqueeze(0))
+        else:
+            markers.visualize(translations=pos[self.vis_envs], orientations=quat[self.vis_envs])
+
+    def _update_goals(self, env_ids: torch.Tensor, center: bool = False) -> None:
+        """Goal positions: maze centre if ``center`` else uniform over the env's maze (cell-aligned)."""
+        local_x, local_y, env_origins = self._sample_cell_positions(env_ids, center)
+        self.goal_pos_w[env_ids, 0] = env_origins[:, 0] + local_x
+        self.goal_pos_w[env_ids, 1] = env_origins[:, 1] + local_y
         self.goal_pos_w[env_ids, 2] = env_origins[:, 2]
-
         self.goal_yaw_w[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
-        self.goal_quat_w[:, 0] = torch.cos(self.goal_yaw_w / 2)  # w
-        self.goal_quat_w[:, 1] = 0.0  # x
-        self.goal_quat_w[:, 2] = 0.0  # y
-        self.goal_quat_w[:, 3] = torch.sin(self.goal_yaw_w / 2)  # z
-
+        self._yaw_to_quat_(self.goal_quat_w, self.goal_yaw_w)
         if self.cfg.vis:
-            if type(self.vis_envs) == int:
-                self.goal_markers.visualize(
-                    translations=self.goal_pos_w[self.vis_envs].unsqueeze(0),
-                    orientations=self.goal_quat_w[self.vis_envs].unsqueeze(0),
-                )
-            else:
-                self.goal_markers.visualize(
-                    translations=self.goal_pos_w[self.vis_envs],
-                    orientations=self.goal_quat_w[self.vis_envs],
-                )
+            self._visualize(self.goal_markers, self.goal_pos_w, self.goal_quat_w)
 
     def _update_starts(self, env_ids: torch.Tensor, center: bool = False) -> None:
-        """Update start positions for the given envs (same sampling rules as `_update_goals`)."""
-        terrain_generator = self.cfg.terrain.terrain_generator
-        maze_cfg = terrain_generator.sub_terrains["maze"]
-        cell_size = float(maze_cfg.cell_size)
-
-        max_cols = max(1, int(round(maze_cfg.maze_max_cols)))
-        terrain_coords = env_ids_to_terrain_coords(env_ids, self._terrain)
-        maze_rows = self.maze_registery.get_num_rows(terrain_coords)
-        maze_cols = torch.full_like(maze_rows, max_cols)
-
-        maze_rows_f = maze_rows.to(dtype=torch.float32)
-        maze_cols_f = maze_cols.to(dtype=torch.float32)
-
-        x_extent = maze_rows_f * cell_size
-        y_extent = maze_cols_f * cell_size
-
-        if center:
-            start_local_x = torch.zeros_like(x_extent)
-            start_local_y = torch.zeros_like(y_extent)
-        else:
-            x_min = -0.5 * x_extent
-            x_min = torch.where(maze_rows_f % 2 == 1, -0.5 * x_extent, -0.5 * x_extent - cell_size)
-            x_max = 0.5 * x_extent
-            y_min = -0.5 * y_extent
-            y_max = torch.where(maze_cols_f % 2 == 1, 0.5 * y_extent, 0.5 * y_extent + cell_size)
-
-            u_x = torch.rand(len(env_ids), device=self.device)
-            u_y = torch.rand(len(env_ids), device=self.device)
-            start_local_x = x_min + u_x * (x_max - x_min)
-            start_local_y = y_min + u_y * (y_max - y_min)
-            start_local_x = torch.where(
-                start_local_x >= 0.0,
-                (start_local_x // cell_size) * cell_size,
-                (start_local_x // cell_size + 1) * cell_size,
-            )
-            start_local_y = torch.where(
-                start_local_y >= 0.0,
-                (start_local_y // cell_size) * cell_size,
-                (start_local_y // cell_size + 1) * cell_size,
-            )
-
-        env_origins = self._terrain.env_origins[env_ids]
-
-        self.start_pos_w[env_ids, 0] = env_origins[:, 0] + start_local_x
-        self.start_pos_w[env_ids, 1] = env_origins[:, 1] + start_local_y
+        """Start positions (same sampling rules as goals)."""
+        local_x, local_y, env_origins = self._sample_cell_positions(env_ids, center)
+        self.start_pos_w[env_ids, 0] = env_origins[:, 0] + local_x
+        self.start_pos_w[env_ids, 1] = env_origins[:, 1] + local_y
         self.start_pos_w[env_ids, 2] = env_origins[:, 2] + self._robot.data.default_root_state[env_ids, 2].clone()
-
         self.start_yaw_w[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
-        self.start_quat_w[:, 0] = torch.cos(self.start_yaw_w / 2)  # w
-        self.start_quat_w[:, 1] = 0.0  # x
-        self.start_quat_w[:, 2] = 0.0  # y
-        self.start_quat_w[:, 3] = torch.sin(self.start_yaw_w / 2)  # z
-
+        self._yaw_to_quat_(self.start_quat_w, self.start_yaw_w)
         if self.cfg.vis:
-            if type(self.vis_envs) == int:
-                self.start_markers.visualize(
-                    translations=self.start_pos_w[self.vis_envs].unsqueeze(0),
-                    orientations=self.start_quat_w[self.vis_envs].unsqueeze(0),
-                )
-            else:
-                self.start_markers.visualize(
-                    translations=self.start_pos_w[self.vis_envs],
-                    orientations=self.start_quat_w[self.vis_envs],
-                )
+            self._visualize(self.start_markers, self.start_pos_w, self.start_quat_w)
 
     #################################################################
     # DEBUG PLOT
     #################################################################
 
     def _plot_map_s(self, vis_envs: torch.Tensor, save_dir: str = None) -> None:
-        """Save a debug image per env in vis_envs under save_dir/env{i}/plot{j}.png.
-
-        Panels: true map (dimmed where never seen) with the true (blue x) and estimated (red +) pose, fused raw map
-        (observed cells only), then the ego-centric crops: denoiser input height, denoiser output height, target
-        height, planner confidence. Ego crops: vertical axis = forward, horizontal axis = left.
-        """
+        """Save a debug image per env in vis_envs under save_dir/env{i}/plot{j}.png (maps + ego crops)."""
         import matplotlib
 
         matplotlib.use("Agg")
@@ -2265,17 +1004,13 @@ class Go2NavEnv(DirectRLEnv):
 
         if save_dir is None:
             save_dir = os.path.join(os.getcwd(), "map_debug")
-
-        if torch.is_tensor(vis_envs):
-            env_ids = vis_envs.reshape(-1).tolist()
-        else:
-            env_ids = [int(vis_envs)]
+        env_ids = vis_envs.reshape(-1).tolist() if torch.is_tensor(vis_envs) else [int(vis_envs)]
+        emap = self.mapper.map
 
         for env_idx in env_ids:
             env_idx = int(env_idx)
             env_dir = os.path.join(save_dir, f"env{env_idx}")
             os.makedirs(env_dir, exist_ok=True)
-
             next_idx = self._map_plot_counter.get(env_idx, 1)
             while os.path.exists(os.path.join(env_dir, f"plot{next_idx}.png")):
                 next_idx += 1
@@ -2283,22 +1018,23 @@ class Go2NavEnv(DirectRLEnv):
             out_path = os.path.join(env_dir, f"plot{next_idx}.png")
 
             ids = torch.tensor([env_idx], device=self.device)
-            crops = self._compute_crops(ids)
+            crops = {**emap.input_crop(self.odom.pose_est, ids), **self.sim_gt.targets(emap, ids)}
             true_pose = self._true_pose_s()[env_idx].detach().cpu().numpy()
-            est_pose = self.pose_est[env_idx].detach().cpu().numpy()
-            seen = self.map_seen_gt[env_idx].detach().cpu().numpy()
-            var = self._map_variance[env_idx].detach().cpu().numpy()
-            raw = self.raw_map[env_idx].detach().cpu().numpy()
-            observed = var < float(self.pp.map_observed_var_thresh)
+            est_pose = self.odom.pose_est[env_idx].detach().cpu().numpy()
+            seen = self.sim_gt.seen[env_idx].detach().cpu().numpy()
+            var = emap.variance[env_idx].detach().cpu().numpy()
+            raw = emap.raw_map[env_idx].detach().cpu().numpy()
+            observed = var < float(self.pp.map.observed_var_thresh)
+            obs = self.mapper.obs
 
             panels = [
-                dict(data=self.true_map[env_idx].detach().cpu().numpy(), title="true_map (dim = never seen)",
+                dict(data=self.sim_gt.true_map[env_idx].detach().cpu().numpy(), title="true_map (dim = never seen)",
                      cmap="terrain", dim=~seen, full=True),
                 dict(data=np.where(observed, raw, np.nan), title="fused raw_map (observed cells)", cmap="terrain", full=True),
                 dict(data=crops["x"][0, 0].cpu().numpy(), title="ego input height (rel. to robot)", cmap="terrain"),
-                dict(data=self._student_map_obs[env_idx, 0].detach().cpu().numpy(), title="ego predicted height", cmap="terrain"),
+                dict(data=obs[env_idx, 0].detach().cpu().numpy(), title="ego predicted height", cmap="terrain"),
                 dict(data=crops["target"][0].cpu().numpy(), title="ego target height", cmap="terrain"),
-                dict(data=self._student_map_obs[env_idx, 1].detach().cpu().numpy(), title="planner confidence",
+                dict(data=obs[env_idx, 1].detach().cpu().numpy(), title="planner confidence",
                      cmap="viridis", vmin=0.0, vmax=1.0),
             ]
 
@@ -2313,17 +1049,11 @@ class Go2NavEnv(DirectRLEnv):
                     dim[..., 3] = np.where(p["dim"].T, 0.65, 0.0)
                     ax.imshow(dim, origin="lower", aspect="equal")
                 if p.get("full"):
-                    origin = self._map_origin[env_idx].cpu().numpy()
-                    ax.plot(
-                        (true_pose[0] - origin[0]) / self._cs - 0.5,
-                        (true_pose[1] - origin[1]) / self._cs - 0.5,
-                        "bx", markersize=10, markeredgewidth=2,
-                    )
-                    ax.plot(
-                        (est_pose[0] - origin[0]) / self._cs - 0.5,
-                        (est_pose[1] - origin[1]) / self._cs - 0.5,
-                        "r+", markersize=12, markeredgewidth=2,
-                    )
+                    origin = emap.origin[env_idx].cpu().numpy()
+                    ax.plot((true_pose[0] - origin[0]) / emap.cs - 0.5, (true_pose[1] - origin[1]) / emap.cs - 0.5,
+                            "bx", markersize=10, markeredgewidth=2)
+                    ax.plot((est_pose[0] - origin[0]) / emap.cs - 0.5, (est_pose[1] - origin[1]) / emap.cs - 0.5,
+                            "r+", markersize=12, markeredgewidth=2)
                 ax.set_title(p["title"], fontsize=9)
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -2345,18 +1075,3 @@ class Go2NavEnv(DirectRLEnv):
         if clamp_abs is not None:
             tensor = torch.clamp(tensor, min=-clamp_abs, max=clamp_abs)
         return tensor
-
-    @staticmethod
-    def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
-        """Normalize angle to [-pi, pi]"""
-        return torch.atan2(torch.sin(angle), torch.cos(angle))
-
-    @staticmethod
-    def _quat_to_yaw(quat_wxyz: torch.Tensor) -> torch.Tensor:
-        qw = quat_wxyz[:, 0]
-        qx = quat_wxyz[:, 1]
-        qy = quat_wxyz[:, 2]
-        qz = quat_wxyz[:, 3]
-        siny = 2.0 * (qw * qz + qx * qy)
-        cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
-        return torch.atan2(siny, cosy)
