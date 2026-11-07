@@ -28,3 +28,7 @@ def quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     xyz = q[..., 1:]
     t = torch.cross(xyz, v, dim=-1) * 2.0
     return v + w * t + torch.cross(xyz, t, dim=-1)
+
+
+def quat_conjugate(q: torch.Tensor) -> torch.Tensor:
+    return torch.cat((q[..., 0:1], -q[..., 1:]), dim=-1)

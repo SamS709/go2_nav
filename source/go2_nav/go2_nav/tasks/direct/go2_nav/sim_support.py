@@ -1,4 +1,4 @@
-"""Simulation-only helpers: sensor cell dropout and the ground-truth supervisor of the map pipeline.
+"""Simulation-only helpers: the ground-truth supervisor of the map pipeline (CellDropout moved to go2_perception.sim_noise).
 
 Nothing in here is needed on the robot.
 """
@@ -10,50 +10,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-
 from .go2_perception.mapping import ElevationMap, shift_grid_
-
-
-class CellDropout:
-    """Gaussian-weighted random cell dropout, one distribution per grid (loc / nav)."""
-
-    def __init__(self, loc_grid, nav_grid, sigma: float, n_zeros: int, max_reset_freq: int, device):
-        self.device = device
-        self.sigma = sigma
-        self.max_reset_freq = int(max_reset_freq)
-        self.prob_loc = self._gaussian_prob(loc_grid.x_cells, loc_grid.y_cells)
-        self.prob_nav = self._gaussian_prob(nav_grid.x_cells, nav_grid.y_cells)
-        self.n_loc = int(n_zeros)
-        self.n_nav = max(1, int(round(n_zeros * nav_grid.num_cells / max(1, loc_grid.num_cells))))
-        self._resample()
-        self.same_count = 0
-        self.reset_freq = int(torch.randint(1, self.max_reset_freq + 1, (1,), device=device).item())
-
-    def _gaussian_prob(self, h: int, w: int) -> torch.Tensor:
-        y = torch.arange(h, device=self.device, dtype=torch.float32)
-        x = torch.arange(w, device=self.device, dtype=torch.float32)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        expo = ((xx - (w - 1) / 2.0) ** 2 + (yy - (h - 1) / 2.0) ** 2) / (2 * self.sigma**2)
-        prob = torch.exp(expo - expo.max())
-        return (prob / prob.sum()).flatten()
-
-    def _resample(self) -> None:
-        self.idx_loc = torch.multinomial(self.prob_loc, self.n_loc, replacement=True)
-        self.idx_nav = torch.multinomial(self.prob_nav, self.n_nav, replacement=True)
-
-    def apply(self, flat_height: torch.Tensor, locomotion: bool):
-        """flat_height [N, cells] -> (height with dropped cells zeroed, keep mask)."""
-        self.same_count += 1
-        if self.same_count == self.reset_freq:
-            self.reset_freq = int(torch.randint(1, self.max_reset_freq + 1, (1,), device=self.device).item())
-            self.same_count = 0
-            self._resample()
-        idx = self.idx_loc if locomotion else self.idx_nav
-        out = flat_height.clone()
-        keep = torch.ones_like(flat_height, dtype=torch.bool)
-        out[:, idx] = 0.0
-        keep[:, idx] = False
-        return out, keep
+from .go2_perception.sim_noise import CellDropout  # noqa: F401  (re-exported)
 
 
 class SimMapSupervisor:

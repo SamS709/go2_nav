@@ -44,6 +44,9 @@ from isaaclab.utils.buffers import DelayBuffer
 
 from .go2_perception import HeightGrid, LocomotionController, MapPerception, OdometryEstimator, PerceptionParams
 from .go2_perception.math_utils import quat_to_roll_pitch, quat_to_yaw, wrap_to_pi
+from .go2_perception.height_grid import rays_in_lidar_frame
+from .go2_perception.locomotion import build_proprio
+from .go2_perception.sim_noise import LidarMisalignment, height_image, sample_lag, set_buffer_lag
 
 from .go2_nav_env_cfg import Go2NavEnvCfg
 from go2_nav.maze_terrain_cfg import MAZE_REGISTRY
@@ -109,9 +112,9 @@ class Go2NavEnv(DirectRLEnv):
             self._loc_heightmap_delay_buffer = mk()
             self._nav_heightmap_delay_buffer = mk()
             self._map_scan_delay_buffer = mk()
-            self._proprio_delay_buffer.set_time_lag(self._proprio_lag.clone())
+            set_buffer_lag(self._proprio_delay_buffer, self._proprio_lag)
             for buf in self._height_delay_buffers:
-                buf.set_time_lag(self._height_lag.clone())
+                set_buffer_lag(buf, self._height_lag)
 
         self._init_goals_and_starts()
         self._finite_warn_counter = 0
@@ -171,9 +174,7 @@ class Go2NavEnv(DirectRLEnv):
         self._t_base_lidar = quat_apply(q_w_base, lidar_pos_w - base_pos_w)
 
     def _sample_lag(self, n: int) -> torch.Tensor:
-        if int(self.cfg.delay_length) <= 0:
-            return torch.zeros(n, dtype=torch.long, device=self.device)
-        return torch.randint(0, int(self.cfg.delay_length), (n,), device=self.device)
+        return sample_lag(n, int(self.cfg.delay_length), self.device)
 
     def _init_goals_and_starts(self):
         # goals
@@ -197,12 +198,7 @@ class Go2NavEnv(DirectRLEnv):
 
         self._height_scanner = self.cfg.height_scanner.class_type(self.cfg.height_scanner)
         self.scene.sensors["height_scanner"] = self._height_scanner
-        self._rots_yaw = torch.empty(self.num_envs, device=self.device)
-        self._rots_roll = torch.empty(self.num_envs, device=self.device)
-        self._offsets = torch.empty(self.num_envs, 3, device=self.device)
-        self._rots_yaw.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
-        self._rots_roll.uniform_(-self.cfg.max_rot, self.cfg.max_rot)
-        self._offsets.uniform_(-self.cfg.max_offset, self.cfg.max_offset)
+        self.lidar_noise = LidarMisalignment(self.num_envs, self.cfg.max_rot, self.cfg.max_offset, self.device)
 
         # height grids (policy convention) and sim-only cell dropout
         self.nav_grid = HeightGrid(
@@ -301,49 +297,24 @@ class Go2NavEnv(DirectRLEnv):
     # SENSOR EMULATION (rays -> height grids / map scan)
     #################################################################
 
-    def _apply_offsets(self, points: torch.Tensor) -> torch.Tensor:
-        return points + self._offsets.unsqueeze(1)
-
-    def _apply_yaw_rotation(self, points: torch.Tensor) -> torch.Tensor:
-        angles = torch.deg2rad(self._rots_yaw).unsqueeze(-1)
-        cos_a, sin_a = torch.cos(angles), torch.sin(angles)
-        x, y, z = points[..., 0], points[..., 1], points[..., 2]
-        return torch.stack((x * cos_a + z * sin_a, y, -x * sin_a + z * cos_a), dim=-1)
-
-    def _apply_roll_rotation(self, points: torch.Tensor) -> torch.Tensor:
-        angles = torch.deg2rad(self._rots_roll).unsqueeze(-1)
-        cos_a, sin_a = torch.cos(angles), torch.sin(angles)
-        x, y, z = points[..., 0], points[..., 1], points[..., 2]
-        return torch.stack((x, y * cos_a - z * sin_a, y * sin_a + z * cos_a), dim=-1)
-
     def _rays_in_lidar_frame(self, randomize: bool) -> torch.Tensor:
         """Ray hits in the lidar frame (policy convention = -(hit rel. to scanner)), cached per step."""
         key = bool(randomize)
         if key in self._ray_cache:
             return self._ray_cache[key]
         data = self._height_scanner.data
-        num_envs, num_rays, _ = data.ray_hits_w.shape
-        rays_rel_w = -data.ray_hits_w + data.pos_w.unsqueeze(1)
-        rays_lidar = quat_apply(
-            quat_conjugate(data.quat_w).unsqueeze(1).expand(num_envs, num_rays, 4).reshape(-1, 4),
-            rays_rel_w.reshape(-1, 3),
-        ).reshape(num_envs, num_rays, 3)
+        rays_lidar = rays_in_lidar_frame(data.ray_hits_w, data.pos_w, data.quat_w)
         if randomize:
-            rays_lidar = self._apply_yaw_rotation(rays_lidar)
-            rays_lidar = self._apply_roll_rotation(rays_lidar)
-            rays_lidar = self._apply_offsets(rays_lidar)
+            rays_lidar = self.lidar_noise.apply(rays_lidar)
         self._ray_cache[key] = rays_lidar
         return rays_lidar
 
     def _height_image(self, grid: HeightGrid, locomotion: bool, randomize: bool, apply_dropout: bool):
         """Height grid [N, X, Y] + valid mask, with the sim-only noise / dropout."""
         rays = self._rays_in_lidar_frame(randomize)
-        height, hit = grid.compute(rays, noise=0.01 if randomize else 0.0)
-        valid = hit
-        if apply_dropout:
-            height, keep = self.dropout.apply(height, locomotion)
-            valid = hit & keep
-        return grid.to_image(height), grid.to_image(valid)
+        return height_image(
+            grid, rays, self.dropout, noise=0.01 if randomize else 0.0, apply_dropout=apply_dropout, locomotion=locomotion
+        )
 
     def _build_nav_heightmap(self) -> torch.Tensor:
         """Policy-convention navigation grid (student_height_scan)."""
@@ -391,11 +362,8 @@ class Go2NavEnv(DirectRLEnv):
         if self.cfg.delay:
             grid = self._loc_heightmap_delay_buffer.compute(grid)
 
-        r = float(self.cfg.randomize)
-        noisy = lambda x, a: x + (2.0 * torch.rand_like(x) - 1.0) * a * r
-        proprio_delayed = torch.cat(
-            [noisy(base_ang_vel, 0.1), noisy(projected_gravity, 0.05), noisy(joint_pos_rel, 0.01), noisy(joint_vel, 0.1)],
-            dim=-1,
+        proprio_delayed = build_proprio(
+            base_ang_vel, projected_gravity, joint_pos_rel, joint_vel, noise_scale=float(self.cfg.randomize)
         )
         proprio_delayed = self._sanitize_tensor(proprio_delayed, "proprio_delayed", clamp_abs=50.0)
         if self.cfg.delay:
@@ -859,17 +827,9 @@ class Go2NavEnv(DirectRLEnv):
         self.sim_gt.reset(env_ids_tensor)
         self.nav_heightmap[env_ids_tensor] = 0.0
 
-        # randomisation of the scan misalignment, per env
+        # randomisation of the lidar mounting error, per env
         num_resets = env_ids_tensor.numel()
-        self._rots_yaw[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(
-            -self.cfg.max_rot, self.cfg.max_rot
-        )
-        self._rots_roll[env_ids_tensor] = torch.empty(num_resets, device=self.device).uniform_(
-            -self.cfg.max_rot, self.cfg.max_rot
-        )
-        self._offsets[env_ids_tensor] = torch.empty(num_resets, 3, device=self.device).uniform_(
-            -self.cfg.max_offset, self.cfg.max_offset
-        )
+        self.lidar_noise.resample(env_ids_tensor)
 
         # ---- delay buffers: only the envs being reset get a new lag (others keep theirs) ----
         if self.cfg.delay:
@@ -880,9 +840,9 @@ class Go2NavEnv(DirectRLEnv):
             self._proprio_lag[env_ids_tensor] = self._sample_lag(num_resets)
             # height-sensor buffers (nav, loc, map scan) and the pose histories share one lag: same physical sensor
             self._height_lag[env_ids_tensor] = self._sample_lag(num_resets)
-            self._proprio_delay_buffer.set_time_lag(self._proprio_lag.clone())
+            set_buffer_lag(self._proprio_delay_buffer, self._proprio_lag)
             for buf in self._height_delay_buffers:
-                buf.set_time_lag(self._height_lag.clone())
+                set_buffer_lag(buf, self._height_lag)
 
         root_state = torch.cat([self.start_pos_w[env_ids], self.start_quat_w[env_ids]], dim=-1)
 

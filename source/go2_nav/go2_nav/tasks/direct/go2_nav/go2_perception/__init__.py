@@ -10,14 +10,14 @@ run in the simulator and on the robot.
 """
 
 from .config import MapParams, MatchParams, OdomParams, PerceptionParams, TrainParams
-from .height_grid import HeightGrid
-from .locomotion import LocomotionController
+from .height_grid import HeightGrid, rays_in_lidar_frame
+from .locomotion import LocomotionController, build_loc_obs, build_proprio
 from .mapping import ElevationMap, MapDenoiser, MapPerception, ScanBuilder
 from .odometry import OdometryEstimator, PositionHistory
 from .scan_matching import ScanToMapMatcher
 
 __all__ = [
     "MapParams", "MatchParams", "OdomParams", "PerceptionParams", "TrainParams",
-    "HeightGrid", "LocomotionController", "ElevationMap", "MapDenoiser", "MapPerception", "ScanBuilder",
+    "HeightGrid", "rays_in_lidar_frame", "LocomotionController", "build_loc_obs", "build_proprio", "ElevationMap", "MapDenoiser", "MapPerception", "ScanBuilder",
     "OdometryEstimator", "PositionHistory", "ScanToMapMatcher",
 ]

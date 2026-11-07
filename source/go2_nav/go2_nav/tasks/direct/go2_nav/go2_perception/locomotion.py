@@ -6,6 +6,24 @@ import os
 
 import torch
 
+# Observation noise of the locomotion policy (ang vel, projected gravity, joint pos, joint vel). Sim only.
+PROPRIO_NOISE = (0.1, 0.05, 0.01, 0.1)
+
+
+def build_proprio(ang_vel, gravity, joint_pos_rel, joint_vel, noise_scale: float = 0.0) -> torch.Tensor:
+    """Policy proprio [N,30]. ``noise_scale`` = 0 on the robot, 1.0 (randomize) in simulation."""
+    parts = []
+    for x, a in zip((ang_vel, gravity, joint_pos_rel, joint_vel), PROPRIO_NOISE):
+        if noise_scale > 0.0:
+            x = x + (2.0 * torch.rand_like(x) - 1.0) * a * noise_scale
+        parts.append(x)
+    return torch.cat(parts, dim=-1)
+
+
+def build_loc_obs(proprio: torch.Tensor, cmd_vel: torch.Tensor, last_actions: torch.Tensor) -> torch.Tensor:
+    """Layout of the locomotion actor observation: [proprio(30), cmd(3), last action(12)]."""
+    return torch.cat([proprio, cmd_vel, last_actions], dim=-1)
+
 
 class LocomotionController:
     """Wraps the TorchScript locomotion policy.
@@ -44,7 +62,7 @@ class LocomotionController:
 
     def build_obs(self, proprio: torch.Tensor, cmd_vel: torch.Tensor) -> torch.Tensor:
         """Uses the PREVIOUS action (call before ``act``)."""
-        return torch.cat([proprio, cmd_vel, self.actions], dim=-1)
+        return build_loc_obs(proprio, cmd_vel, self.actions)
 
     def act(self, obs: torch.Tensor, height_grid: torch.Tensor) -> torch.Tensor:
         self.prev_actions.copy_(self.actions)

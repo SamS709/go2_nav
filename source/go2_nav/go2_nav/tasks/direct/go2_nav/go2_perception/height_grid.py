@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import torch
 
+from .math_utils import quat_apply, quat_conjugate
+
+
+def rays_in_lidar_frame(ray_hits_w: torch.Tensor, lidar_pos_w: torch.Tensor, lidar_quat_w: torch.Tensor) -> torch.Tensor:
+    """World-frame ray hits [N,R,3] -> policy-convention rays in the lidar frame: -(hit rel. to scanner)."""
+    n, r, _ = ray_hits_w.shape
+    rel_w = -ray_hits_w + lidar_pos_w.unsqueeze(1)
+    q = quat_conjugate(lidar_quat_w).unsqueeze(1).expand(n, r, 4)
+    return quat_apply(q, rel_w)
+
 
 class HeightGrid:
     def __init__(self, x_range, y_range, cell_size: float, desired_base_height: float, device):
